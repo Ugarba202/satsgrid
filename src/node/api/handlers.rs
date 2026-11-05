@@ -63,8 +63,17 @@ pub async fn new_session(
     let uuid = uuid::Uuid::new_v4();
     let session_id = SessionId(uuid);
 
-    // Register session in the budget manager
-    state.budget_manager.open_session(&session_id, budget).await;
+    // Register session in the budget manager (backed by SQLite when db is active)
+    let default_expiry = chrono::Utc::now().timestamp() + 86400 * 30; // 30 days
+    state
+        .budget_manager
+        .open_session_with_details(
+            &session_id,
+            Some(&invoice.payment_hash),
+            budget,
+            default_expiry,
+        )
+        .await?;
 
     // Mint macaroon with session caveats
     let caveats = vec![
@@ -202,27 +211,254 @@ pub async fn chat_completions(
     let (session_opt, _) =
         crate::node::gate::SessionBudgetManager::extract_session_caveats(&credentials.macaroon);
 
-    if let Some(session_id) = session_opt {
-        let remaining = state
-            .budget_manager
-            .debit_session(&session_id, cost)
-            .await
-            .map_err(|e| Error::BudgetExhausted(e.to_string()))?;
-
-        response_headers.insert(
-            "X-SatsGrid-Remaining-Budget-Sats",
-            remaining.0.to_string().parse().unwrap(),
-        );
-    }
+    let payment_hash = credentials.macaroon.payment_hash();
 
     let is_stream = payload
         .get("stream")
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
 
+    let req_mode = if is_stream {
+        crate::node::storage::RequestMode::Streaming
+    } else {
+        crate::node::storage::RequestMode::NonStreaming
+    };
+
+    let internal_request_id = uuid::Uuid::new_v4().to_string();
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .or_else(|| headers.get("X-Request-ID"))
+        .and_then(|v| v.to_str().ok());
+
+    let mut session_reservation_id: Option<String> = None;
+
+    if let Some(session_id) = &session_opt {
+        // Check session idempotency key if provided
+        if let (Some(db), Some(idem_key)) = (&state.db, idempotency_key) {
+            let req_store = db.request_store();
+            if let Some(existing) = req_store
+                .find_by_idempotency_key(session_id, idem_key)
+                .await?
+            {
+                if existing.status == crate::node::storage::RequestStatus::Completed {
+                    return Err(Error::VerificationFailed(
+                        "Idempotency key has already been consumed for this session".to_string(),
+                    ));
+                } else if existing.status == crate::node::storage::RequestStatus::Processing
+                    || existing.status == crate::node::storage::RequestStatus::Reserved
+                {
+                    return Err(Error::VerificationFailed(
+                        "A request with this idempotency key is currently in flight".to_string(),
+                    ));
+                }
+            }
+        }
+
+        // Two-phase session reservation: reserve budget first
+        let res_id = uuid::Uuid::new_v4().to_string();
+        let remaining = state
+            .budget_manager
+            .reserve_session(session_id, cost, &res_id)
+            .await
+            .map_err(|e| Error::BudgetExhausted(e.to_string()))?;
+
+        session_reservation_id = Some(res_id.clone());
+
+        response_headers.insert(
+            "X-SatsGrid-Remaining-Budget-Sats",
+            remaining.0.to_string().parse().unwrap(),
+        );
+
+        if let Some(db) = &state.db {
+            let req_store = db.request_store();
+            req_store
+                .create_request(
+                    &internal_request_id,
+                    None,
+                    Some(session_id),
+                    Some(&res_id),
+                    idempotency_key,
+                    req_model.unwrap_or("unknown"),
+                    req_mode,
+                    cost,
+                )
+                .await?;
+        }
+    } else {
+        // Pay-per-request mode: enforce single-use authorization in persistent storage
+        if let Some(db) = &state.db {
+            let expires_at = credentials.macaroon.expires_at().unwrap_or(now + 3600);
+
+            let store = db.payment_store();
+            let reservation = store
+                .reserve_payment_hash(
+                    &payment_hash,
+                    &internal_request_id,
+                    expires_at,
+                    idempotency_key,
+                )
+                .await?;
+
+            match reservation {
+                crate::node::storage::ReservationResult::Reserved => {
+                    store.mark_settled_and_consumed(&payment_hash).await?;
+                }
+                crate::node::storage::ReservationResult::AlreadyUsed {
+                    state: auth_state, ..
+                } => {
+                    tracing::warn!(
+                        payment_hash = %payment_hash.0,
+                        state = %auth_state,
+                        "Replay detected for pay-per-request payment hash"
+                    );
+                    return Err(Error::Unauthorized(
+                        "Payment token has already been redeemed. Pay-per-request tokens are single-use.".to_string(),
+                    ));
+                }
+            }
+
+            let req_store = db.request_store();
+            req_store
+                .create_request(
+                    &internal_request_id,
+                    Some(&payment_hash),
+                    None,
+                    None,
+                    idempotency_key,
+                    req_model.unwrap_or("unknown"),
+                    req_mode,
+                    cost,
+                )
+                .await?;
+        }
+    }
+
+    // Durable Dispatch Boundary: Commit 'processing' state before upstream HTTP call
+    if let Some(db) = &state.db {
+        db.request_store()
+            .mark_processing(&internal_request_id)
+            .await?;
+    }
+
     if is_stream {
-        let stream = state.proxy.stream_chat_completion(payload).await?;
-        let body = axum::body::Body::from_stream(stream);
+        let stream_result = state.proxy.stream_chat_completion(payload).await;
+
+        let stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                // Confirmed pre-generation failure before stream start
+                if let Some(db) = &state.db {
+                    let _ = db
+                        .request_store()
+                        .mark_failed(
+                            &internal_request_id,
+                            "upstream_connect_error",
+                            "pre_dispatch",
+                        )
+                        .await;
+                }
+                if let Some(res_id) = &session_reservation_id {
+                    let _ = state
+                        .budget_manager
+                        .release_reservation(res_id, "upstream_pre_generation_failure")
+                        .await;
+                }
+                return Err(e);
+            }
+        };
+
+        // Finalize session reservation upon establishing stream
+        if let Some(res_id) = &session_reservation_id {
+            let _ = state.budget_manager.finalize_reservation(res_id).await;
+        }
+
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        let db_opt = state.db.clone();
+        let req_id_clone = internal_request_id.clone();
+        let prompt_tokens_i64 = prompt_tokens as i64;
+
+        struct MonitoredStream<S> {
+            inner: S,
+            req_id: String,
+            db: Option<std::sync::Arc<crate::node::storage::Database>>,
+            prompt_tokens: i64,
+            completed: std::sync::Arc<AtomicBool>,
+        }
+
+        impl<S> Drop for MonitoredStream<S> {
+            fn drop(&mut self) {
+                // If stream is dropped before completion, mark stream_interrupted
+                if !self.completed.load(Ordering::SeqCst) {
+                    if let Some(db) = &self.db {
+                        let req_store = db.request_store();
+                        let r_id = self.req_id.clone();
+                        tokio::spawn(async move {
+                            let _ = req_store
+                                .mark_stream_interrupted(&r_id, "client_disconnected_early", None)
+                                .await;
+                        });
+                    }
+                }
+            }
+        }
+
+        impl<
+                S: futures_util::Stream<Item = crate::common::error::Result<bytes::Bytes>> + Unpin,
+            > futures_util::Stream for MonitoredStream<S>
+        {
+            type Item = crate::common::error::Result<bytes::Bytes>;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+                    Poll::Ready(Some(Err(e))) => {
+                        self.completed.store(true, Ordering::SeqCst);
+                        if let Some(db) = &self.db {
+                            let req_store = db.request_store();
+                            let r_id = self.req_id.clone();
+                            tokio::spawn(async move {
+                                let _ = req_store
+                                    .mark_stream_interrupted(&r_id, "stream_read_error", None)
+                                    .await;
+                            });
+                        }
+                        Poll::Ready(Some(Err(e)))
+                    }
+                    Poll::Ready(None) => {
+                        // Stream finished normally!
+                        if !self.completed.swap(true, Ordering::SeqCst) {
+                            if let Some(db) = &self.db {
+                                let req_store = db.request_store();
+                                let r_id = self.req_id.clone();
+                                let p_tok = self.prompt_tokens;
+                                tokio::spawn(async move {
+                                    let _ =
+                                        req_store.mark_completed(&r_id, Some(p_tok), None).await;
+                                });
+                            }
+                        }
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
+            }
+        }
+
+        let monitored_stream = MonitoredStream {
+            inner: stream,
+            req_id: req_id_clone,
+            db: db_opt,
+            prompt_tokens: prompt_tokens_i64,
+            completed: std::sync::Arc::new(AtomicBool::new(false)),
+        };
+
+        let body = axum::body::Body::from_stream(monitored_stream);
         let mut resp = body.into_response();
         resp.headers_mut().extend(response_headers);
         resp.headers_mut()
@@ -239,25 +475,71 @@ pub async fn chat_completions(
 
         Ok(resp)
     } else {
-        // Proxy the request
-        let proxy_resp = state
+        // Proxy the request non-streaming
+        let proxy_res = state
             .proxy
             .forward_chat_completion_with_headers(payload, headers)
-            .await?;
+            .await;
 
-        let mut resp = Json(proxy_resp).into_response();
-        resp.headers_mut().extend(response_headers);
+        match proxy_res {
+            Ok(proxy_resp) => {
+                // Upstream success: extract tokens if available
+                let (prompt_tok, comp_tok) = {
+                    let usage = proxy_resp.get("usage");
+                    let p = usage
+                        .and_then(|u| u.get("prompt_tokens"))
+                        .and_then(|v| v.as_i64());
+                    let c = usage
+                        .and_then(|u| u.get("completion_tokens"))
+                        .and_then(|v| v.as_i64());
+                    (p, c)
+                };
 
-        state
-            .stats
-            .total_requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        state
-            .stats
-            .total_sats_earned
-            .fetch_add(cost.0, std::sync::atomic::Ordering::SeqCst);
+                if let Some(db) = &state.db {
+                    let _ = db
+                        .request_store()
+                        .mark_completed(&internal_request_id, prompt_tok, comp_tok)
+                        .await;
+                }
 
-        Ok(resp)
+                if let Some(res_id) = &session_reservation_id {
+                    let _ = state.budget_manager.finalize_reservation(res_id).await;
+                }
+
+                let mut resp = Json(proxy_resp).into_response();
+                resp.headers_mut().extend(response_headers);
+
+                state
+                    .stats
+                    .total_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .stats
+                    .total_sats_earned
+                    .fetch_add(cost.0, std::sync::atomic::Ordering::SeqCst);
+
+                Ok(resp)
+            }
+            Err(e) => {
+                // Confirmed upstream failure
+                if let Some(db) = &state.db {
+                    let _ = db
+                        .request_store()
+                        .mark_failed(&internal_request_id, "upstream_error", "proxy_forward")
+                        .await;
+                }
+
+                // Release session reservation so user is not billed for failed execution
+                if let Some(res_id) = &session_reservation_id {
+                    let _ = state
+                        .budget_manager
+                        .release_reservation(res_id, "upstream_execution_failure")
+                        .await;
+                }
+
+                Err(e)
+            }
+        }
     }
 }
 

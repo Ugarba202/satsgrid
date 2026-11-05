@@ -66,6 +66,7 @@ fn setup_app() -> axum::Router {
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
     };
 
     create_routes(state).layer(

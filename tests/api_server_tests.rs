@@ -45,6 +45,7 @@ fn setup_app() -> axum::Router {
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
     };
 
     create_routes(state)
@@ -133,6 +134,7 @@ async fn test_models_endpoint_dynamic_upstream() {
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
     };
 
     let app = create_routes(state);
@@ -237,6 +239,7 @@ async fn test_chat_completions_pay_per_request_flow() {
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
     };
 
     let app = create_routes(state);
@@ -387,6 +390,7 @@ async fn test_api_e2e_flow_with_budget_debit() {
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
     };
 
     let macaroon_service = state.macaroon_service.clone();
@@ -517,6 +521,7 @@ async fn test_chat_completions_capability_authorization() {
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
     };
 
     let macaroon_service = state.macaroon_service.clone();
