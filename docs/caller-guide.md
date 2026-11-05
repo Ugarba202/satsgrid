@@ -4,28 +4,28 @@ This guide explains how humans and autonomous agents consume inference from an S
 
 ---
 
-## 1. Discovering Live Nodes (`infernos discover`)
+## 1. Discovering Live Nodes (`satsgrid discover`)
 
 Before sending inference requests, autonomous agents and callers can dynamically discover active SatsGrid nodes across Nostr relays without relying on a centralized index:
 
 ```bash
 # Discover all active SatsGrid nodes on default relays
-infernos discover
+satsgrid discover
 
 # Find nodes offering a specific model
-infernos discover --model llama3.2
+satsgrid discover --model llama3.2
 
 # Output machine-readable JSON for automated agent pipelines
-infernos discover --model llama3.2 --json
+satsgrid discover --model llama3.2 --json
 ```
 
 Example JSON output for agent routing:
 ```json
 [
   {
-    "service": "infernos",
+    "service": "satsgrid",
     "name": "Alpha Node",
-    "node_url": "https://alpha.infernos.org",
+    "node_url": "https://alpha.satsgrid.org",
     "models": ["llama3.2", "mistral"],
     "pricing_sats": 10,
     "network": "mainnet",
@@ -39,7 +39,7 @@ Example JSON output for agent routing:
 
 ## 2. Using the Command-Line Interface (CLI)
 
-The easiest way to query an SatsGrid node directly is via the `infernos call` command.
+The easiest way to query an SatsGrid node directly is via the `satsgrid call` command.
 
 ### Basic Pay-per-Request Query
 ```bash
@@ -75,14 +75,14 @@ Remaining:  90 sats
 
 ---
 
-## 2. Using the Rust SDK (`infernos::client`)
+## 3. Using the Rust SDK (`satsgrid::client`)
 
 For developers integrating autonomous agents or microservices, the built-in Rust client handles the full L402 handshake, budget tracking, and streaming automatically.
 
 ```rust
-use infernos::client::builder::ClientBuilder;
-use infernos::client::budget::ClientBudgetTracker;
-use infernos::client::openai::{ChatCompletionRequest, ChatMessage};
+use satsgrid::client::builder::ClientBuilder;
+use satsgrid::client::budget::ClientBudgetTracker;
+use satsgrid::client::openai::{ChatCompletionRequest, ChatMessage};
 use std::sync::Arc;
 
 #[tokio::main]
