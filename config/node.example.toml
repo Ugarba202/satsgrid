@@ -1,0 +1,67 @@
+# ==============================================================================
+# SatsGrid Node Configuration (Example)
+# ==============================================================================
+
+[server]
+# The host address to bind the SatsGrid L402 Gate to.
+# Default: "0.0.0.0" (Listens on all interfaces)
+host = "0.0.0.0"
+
+# The port to bind the SatsGrid L402 Gate to.
+# Default: 8080
+port = 8080
+
+[upstream]
+# The URL of the upstream inference engine (e.g., Ollama or vLLM).
+# Default: "http://127.0.0.1:11434"
+url = "http://127.0.0.1:11434"
+
+[pricing]
+# The default price per inference request, specified in Satoshis (sats).
+# Default: 10 (or sats_per_request = 10)
+default_price_sats = 10
+# Optional: fine-grained per-token pricing in milli-satoshis (or satoshi fraction)
+# sats_per_prompt_token = 0.001
+# sats_per_completion_token = 0.002
+
+
+[lightning]
+# Lightning backend type: "lnd", "mock", or "nwc"
+# Default: "mock" (in-memory simulator for local zero-wallet testing)
+backend = "mock"
+
+# Bitcoin network: "testnet" (for local testing with testnet sats) or "mainnet" (for live production)
+# Options: "mainnet", "testnet", "regtest", "signet"
+network = "testnet"
+
+# LND REST Configuration (required if backend = "lnd")
+# The REST API address of your LND node (LND default REST port is 8080)
+# lnd_rest_host = "https://127.0.0.1:8080"
+# Path to your LND admin.macaroon or invoice.macaroon:
+# - For Testnet: "~/.lnd/data/chain/bitcoin/testnet/admin.macaroon"
+# - For Mainnet: "~/.lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+# lnd_macaroon_path = "~/.lnd/data/chain/bitcoin/testnet/admin.macaroon"
+# Optional path to LND tls.cert:
+# lnd_tls_cert_path = "~/.lnd/tls.cert"
+
+# Nostr Wallet Connect Configuration (required if backend = "nwc")
+# nwc_uri = "nostr+walletconnect://..."
+
+[discovery]
+# Enable periodic/automatic announcements to Nostr relays
+# Default: false
+# enabled = false
+
+# Nostr relays for broadcasting node presence and model availability
+# Default: ["wss://relay.damus.io", "wss://nos.lol"]
+# relays = ["wss://relay.damus.io", "wss://nos.lol"]
+
+# Friendly public name for the node
+# node_name = "My GPU Cluster"
+
+# Public endpoint URL that callers can reach (e.g., https://node.example.com)
+# public_url = "https://node.example.com"
+
+# Optional private key (nsec) to maintain a persistent Nostr identity
+# nsec = "nsec1..."
+

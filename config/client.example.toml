@@ -1,0 +1,19 @@
+# ==============================================================================
+# SatsGrid Client Configuration (Example)
+# ==============================================================================
+
+[client]
+# The URL of the SatsGrid node to connect to.
+# Default: "http://127.0.0.1:8080"
+node_url = "http://127.0.0.1:8080"
+
+[budget]
+# The maximum budget in Satoshis (sats) that the client is allowed to spend
+# for a single session. This acts as a safety guard to prevent draining funds.
+# Default: 1000
+max_budget_sats = 1000
+
+[lightning]
+# Payment method for automated L402 invoice settlement: "mock", "lnd", or "nwc"
+# Default: "mock"
+payment_backend = "mock"

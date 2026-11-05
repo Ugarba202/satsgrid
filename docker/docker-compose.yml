@@ -1,0 +1,38 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: satsgrid-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  satsgrid-node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: satsgrid-node
+    ports:
+      - "8080:8080"
+    depends_on:
+      ollama:
+        condition: service_started
+    volumes:
+      - ../config/node.example.toml:/etc/satsgrid/node.toml:ro
+    environment:
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  ollama_data:
