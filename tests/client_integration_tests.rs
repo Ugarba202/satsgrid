@@ -125,6 +125,7 @@ async fn test_end_to_end_client_node_integration() {
         proxy: OpenAiProxy::new(upstream_mock.uri()),
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
     };
 
     let app = create_routes(state);

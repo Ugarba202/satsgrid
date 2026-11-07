@@ -55,33 +55,175 @@ impl SessionBudget {
     }
 }
 
-/// In-memory manager tracking active session budgets across multiple concurrent requests.
+/// Manager tracking active session budgets across multiple concurrent requests,
+/// backed by durable SQLite storage when a `SessionStore` is provided, or an in-memory map otherwise.
 #[derive(Clone, Default)]
 pub struct SessionBudgetManager {
     sessions: Arc<RwLock<HashMap<String, SessionBudget>>>,
+    store: Option<crate::node::storage::session::SessionStore>,
 }
 
 impl SessionBudgetManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            store: None,
+        }
+    }
+
+    /// Construct a SessionBudgetManager backed by durable SQLite storage.
+    pub fn with_store(store: crate::node::storage::session::SessionStore) -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            store: Some(store),
         }
     }
 
     /// Open or register a new session with an allocated budget limit.
     pub async fn open_session(&self, session_id: &SessionId, total_budget: Satoshis) {
+        if let Some(store) = &self.store {
+            let default_expiry = chrono::Utc::now().timestamp() + 86400 * 30; // 30 days default
+            let _ = store
+                .create_session(session_id, None, total_budget, default_expiry)
+                .await;
+        }
+
         let mut lock = self.sessions.write().await;
         lock.insert(session_id.0.to_string(), SessionBudget::new(total_budget));
     }
 
+    /// Open a persistent session with explicit funding payment hash and expiry.
+    pub async fn open_session_with_details(
+        &self,
+        session_id: &SessionId,
+        payment_hash: Option<&crate::common::types::PaymentHash>,
+        total_budget: Satoshis,
+        expires_at: i64,
+    ) -> Result<()> {
+        if let Some(store) = &self.store {
+            store
+                .create_session(session_id, payment_hash, total_budget, expires_at)
+                .await?;
+        }
+
+        let mut lock = self.sessions.write().await;
+        lock.insert(session_id.0.to_string(), SessionBudget::new(total_budget));
+        Ok(())
+    }
+
     /// Look up an active session budget by session ID.
     pub async fn get_session(&self, session_id: &SessionId) -> Option<SessionBudget> {
+        if let Some(store) = &self.store {
+            if let Ok(Some(record)) = store.get_session(session_id).await {
+                return Some(SessionBudget {
+                    total_sats: record.total_budget_sats,
+                    remaining_sats: Arc::new(AtomicU64::new(record.remaining_sats.0)),
+                });
+            }
+            return None;
+        }
+
         let lock = self.sessions.read().await;
         lock.get(&session_id.0.to_string()).cloned()
     }
 
+    /// Atomically reserve a cost from an active session, returning the reservation ID and remaining balance.
+    pub async fn reserve_session(
+        &self,
+        session_id: &SessionId,
+        cost: Satoshis,
+        reservation_id: &str,
+    ) -> Result<Satoshis> {
+        if let Some(store) = &self.store {
+            match store
+                .reserve_budget(session_id, cost, reservation_id)
+                .await?
+            {
+                crate::node::storage::SessionReservationResult::Reserved {
+                    remaining_sats, ..
+                } => {
+                    // Sync in-memory view
+                    let mut lock = self.sessions.write().await;
+                    if let Some(b) = lock.get_mut(&session_id.0.to_string()) {
+                        b.remaining_sats.store(remaining_sats.0, Ordering::SeqCst);
+                    }
+                    return Ok(remaining_sats);
+                }
+                crate::node::storage::SessionReservationResult::NotFound => {
+                    return Err(Error::VerificationFailed(format!(
+                        "Session '{}' not found",
+                        session_id.0
+                    )));
+                }
+                crate::node::storage::SessionReservationResult::Expired { .. } => {
+                    return Err(Error::VerificationFailed(format!(
+                        "Session '{}' has expired",
+                        session_id.0
+                    )));
+                }
+                crate::node::storage::SessionReservationResult::Inactive { status } => {
+                    return Err(Error::VerificationFailed(format!(
+                        "Session '{}' is not active (status: {})",
+                        session_id.0,
+                        status.as_str()
+                    )));
+                }
+                crate::node::storage::SessionReservationResult::InsufficientBudget {
+                    requested,
+                    available,
+                } => {
+                    return Err(Error::BudgetExhausted(format!(
+                        "Request cost {} sats exceeds remaining budget of {} sats",
+                        requested.0, available.0
+                    )));
+                }
+            }
+        }
+
+        // Ephemeral in-memory fallback
+        let session = {
+            let lock = self.sessions.read().await;
+            lock.get(&session_id.0.to_string())
+                .cloned()
+                .ok_or_else(|| {
+                    Error::VerificationFailed(format!(
+                        "Session '{}' not found or expired",
+                        session_id.0
+                    ))
+                })?
+        };
+
+        session.debit(cost)
+    }
+
+    /// Finalize an active reservation.
+    pub async fn finalize_reservation(&self, reservation_id: &str) -> Result<()> {
+        if let Some(store) = &self.store {
+            store.finalize_reservation(reservation_id).await?;
+        }
+        Ok(())
+    }
+
+    /// Release an active reservation (e.g. pre-generation failure).
+    pub async fn release_reservation(&self, reservation_id: &str, reason: &str) -> Result<()> {
+        if let Some(store) = &self.store {
+            store.release_reservation(reservation_id, reason).await?;
+        }
+        Ok(())
+    }
+
     /// Debit an active session, returning the new remaining balance.
+    ///
+    /// For backward compatibility with tests and callers expecting direct debit semantics:
+    /// executes an atomic reserve followed immediately by finalization.
     pub async fn debit_session(&self, session_id: &SessionId, cost: Satoshis) -> Result<Satoshis> {
+        if self.store.is_some() {
+            let res_id = uuid::Uuid::new_v4().to_string();
+            let remaining = self.reserve_session(session_id, cost, &res_id).await?;
+            self.finalize_reservation(&res_id).await?;
+            return Ok(remaining);
+        }
+
         let session = self.get_session(session_id).await.ok_or_else(|| {
             Error::VerificationFailed(format!("Session '{}' not found or expired", session_id.0))
         })?;
