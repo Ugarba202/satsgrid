@@ -1,5 +1,6 @@
 pub mod handlers;
 pub mod routes;
+pub mod validation;
 
 use crate::config::schema::{NodeConfig, PricingConfig};
 use crate::node::gate::{MacaroonService, SessionBudgetManager};

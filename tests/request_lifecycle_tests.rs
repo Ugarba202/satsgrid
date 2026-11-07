@@ -755,6 +755,7 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {

@@ -33,4 +33,7 @@ pub enum Error {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error("Validation error: {0:?}")]
+    Validation(crate::node::api::validation::OpenAiErrorResponse),
 }

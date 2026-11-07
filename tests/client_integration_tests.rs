@@ -103,6 +103,7 @@ async fn test_end_to_end_client_node_integration() {
             host: "127.0.0.1".to_string(),
             port: 0,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(Satoshis(10)),
         upstream: UpstreamConfig {

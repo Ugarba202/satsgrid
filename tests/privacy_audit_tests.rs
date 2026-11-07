@@ -41,6 +41,7 @@ fn setup_app() -> axum::Router {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {

@@ -21,6 +21,7 @@ fn setup_app() -> axum::Router {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
@@ -110,6 +111,7 @@ async fn test_models_endpoint_dynamic_upstream() {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
@@ -212,6 +214,7 @@ async fn test_chat_completions_pay_per_request_flow() {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
@@ -365,6 +368,7 @@ async fn test_api_e2e_flow_with_budget_debit() {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
@@ -495,6 +499,7 @@ async fn test_chat_completions_capability_authorization() {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {

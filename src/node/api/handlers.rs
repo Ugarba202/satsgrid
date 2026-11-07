@@ -42,7 +42,9 @@ pub struct NewSessionRequest {
 
 pub async fn new_session(
     State(state): State<AppState>,
-    Json(payload): Json<NewSessionRequest>,
+    crate::node::api::validation::BoundedJson(payload): crate::node::api::validation::BoundedJson<
+        NewSessionRequest,
+    >,
 ) -> Result<impl IntoResponse, Error> {
     if payload.budget_sats == 0 {
         return Err(Error::Internal(
@@ -111,24 +113,31 @@ pub async fn new_session(
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    crate::node::api::validation::BoundedJson(payload): crate::node::api::validation::BoundedJson<
+        Value,
+    >,
 ) -> Result<impl IntoResponse, Error> {
+    // 1. Pre-auth Request Schema Validation
+    // Validate model, messages, roles, content, parameters before inspecting credentials or reserving funds.
+    let validation_rules = crate::node::api::validation::ChatValidationRules {
+        max_completion_tokens_limit: state.config.server.max_completion_tokens_limit,
+    };
+    let validated =
+        crate::node::api::validation::ValidatedChatRequest::validate(payload, &validation_rules)
+            .map_err(Error::Validation)?;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    let prompt_tokens =
-        crate::node::pricing::PricingCalculator::estimate_prompt_tokens_from_payload(&payload);
-    let max_completion_tokens = payload
-        .get("max_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let prompt_tokens = validated.prompt_tokens;
+    let max_completion_tokens = validated.max_tokens;
     let cost = state
         .pricing_calculator()
         .await
         .calculate_cost(prompt_tokens, max_completion_tokens);
-    let req_model = payload.get("model").and_then(|m| m.as_str());
+    let req_model = Some(validated.model.as_str());
 
     let auth_header = headers.get("Authorization");
     if auth_header.is_none()
@@ -213,10 +222,7 @@ pub async fn chat_completions(
 
     let payment_hash = credentials.macaroon.payment_hash();
 
-    let is_stream = payload
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
+    let is_stream = validated.is_stream;
 
     let req_mode = if is_stream {
         crate::node::storage::RequestMode::Streaming
@@ -278,7 +284,7 @@ pub async fn chat_completions(
                     Some(session_id),
                     Some(&res_id),
                     idempotency_key,
-                    req_model.unwrap_or("unknown"),
+                    &validated.model,
                     req_mode,
                     cost,
                 )
@@ -325,7 +331,7 @@ pub async fn chat_completions(
                     None,
                     None,
                     idempotency_key,
-                    req_model.unwrap_or("unknown"),
+                    &validated.model,
                     req_mode,
                     cost,
                 )
@@ -341,7 +347,7 @@ pub async fn chat_completions(
     }
 
     if is_stream {
-        let stream_result = state.proxy.stream_chat_completion(payload).await;
+        let stream_result = state.proxy.stream_chat_completion(validated.raw).await;
 
         let stream = match stream_result {
             Ok(s) => s,
@@ -478,7 +484,7 @@ pub async fn chat_completions(
         // Proxy the request non-streaming
         let proxy_res = state
             .proxy
-            .forward_chat_completion_with_headers(payload, headers)
+            .forward_chat_completion_with_headers(validated.raw, headers)
             .await;
 
         match proxy_res {
@@ -629,6 +635,9 @@ impl IntoResponse for Error {
             Error::BudgetExhausted(_) => (StatusCode::PAYMENT_REQUIRED, self.to_string()),
             Error::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             Error::Lightning(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            Error::Validation(val_err) => {
+                return val_err.to_response(StatusCode::BAD_REQUEST);
+            }
             Error::Config(_) | Error::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }

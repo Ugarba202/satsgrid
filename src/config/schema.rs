@@ -10,12 +10,24 @@ pub enum LightningBackendType {
     Nwc,
 }
 
+fn default_max_request_body_bytes() -> usize {
+    2 * 1024 * 1024 // 2 MB
+}
+
+fn default_max_completion_tokens_limit() -> usize {
+    128_000 // 128k tokens maximum boundary
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     #[serde(default)]
     pub admin_token: Option<String>,
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+    #[serde(default = "default_max_completion_tokens_limit")]
+    pub max_completion_tokens_limit: usize,
 }
 
 impl Default for ServerConfig {
@@ -24,6 +36,8 @@ impl Default for ServerConfig {
             host: "0.0.0.0".to_string(),
             port: 8080,
             admin_token: None,
+            max_request_body_bytes: default_max_request_body_bytes(),
+            max_completion_tokens_limit: default_max_completion_tokens_limit(),
         }
     }
 }
