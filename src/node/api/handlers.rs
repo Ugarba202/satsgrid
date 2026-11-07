@@ -346,29 +346,100 @@ pub async fn chat_completions(
             .await?;
     }
 
+    let upstream_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // RAII guard to safely handle client cancellations, timeouts, or unexpected task aborts
+    // occurring while request is in the 'processing' state.
+    struct DispatchCancellationGuard {
+        request_id: String,
+        session_reservation_id: Option<String>,
+        db: Option<std::sync::Arc<crate::node::storage::Database>>,
+        upstream_dispatched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        defused: bool,
+    }
+
+    impl DispatchCancellationGuard {
+        fn defuse(&mut self) {
+            self.defused = true;
+        }
+    }
+
+    impl Drop for DispatchCancellationGuard {
+        fn drop(&mut self) {
+            if !self.defused {
+                if let Some(db) = self.db.take() {
+                    let r_id = self.request_id.clone();
+                    let s_res = self.session_reservation_id.clone();
+                    let dispatched = self
+                        .upstream_dispatched
+                        .load(std::sync::atomic::Ordering::SeqCst);
+
+                    tokio::spawn(async move {
+                        let req_store = db.request_store();
+                        if !dispatched {
+                            // If we definitely know the request was not sent or failed before transmission,
+                            // mark failed and release session reservation.
+                            let _ = req_store
+                                .mark_failed(&r_id, "connect_timeout_or_abort", "pre_dispatch")
+                                .await;
+                            if let Some(res_id) = s_res {
+                                let _ = db
+                                    .session_store()
+                                    .release_reservation(&res_id, "connect_timeout_or_abort")
+                                    .await;
+                            }
+                        } else {
+                            // Upstream transmission was in flight; execution may have occurred.
+                            // Conservative reconciliation required to protect session budget.
+                            let _ = req_store
+                                .mark_reconciliation_required(
+                                    &r_id,
+                                    "client_abort_or_timeout_after_dispatch",
+                                )
+                                .await;
+                            if let Some(res_id) = s_res {
+                                let _ = db
+                                    .session_store()
+                                    .mark_reconciliation_required(
+                                        &res_id,
+                                        "client_abort_or_timeout_after_dispatch",
+                                    )
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    let mut dispatch_guard = DispatchCancellationGuard {
+        request_id: internal_request_id.clone(),
+        session_reservation_id: session_reservation_id.clone(),
+        db: state.db.clone(),
+        upstream_dispatched: upstream_dispatched.clone(),
+        defused: false,
+    };
+
+    let total_timeout =
+        std::time::Duration::from_secs(state.config.upstream.total_request_timeout_secs);
+    let idle_timeout =
+        std::time::Duration::from_secs(state.config.upstream.stream_idle_timeout_secs);
+
     if is_stream {
+        upstream_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
         let stream_result = state.proxy.stream_chat_completion(validated.raw).await;
 
         let stream = match stream_result {
             Ok(s) => s,
             Err(e) => {
-                // Confirmed pre-generation failure before stream start
-                if let Some(db) = &state.db {
-                    let _ = db
-                        .request_store()
-                        .mark_failed(
-                            &internal_request_id,
-                            "upstream_connect_error",
-                            "pre_dispatch",
-                        )
-                        .await;
+                // If it is an explicit connection failure, the request was definitely not executed
+                if matches!(e, Error::UpstreamConnect(_)) {
+                    dispatch_guard
+                        .upstream_dispatched
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
-                if let Some(res_id) = &session_reservation_id {
-                    let _ = state
-                        .budget_manager
-                        .release_reservation(res_id, "upstream_pre_generation_failure")
-                        .await;
-                }
+                // Dropping dispatch_guard here will safely handle transitions based on upstream_dispatched flag
                 return Err(e);
             }
         };
@@ -378,6 +449,7 @@ pub async fn chat_completions(
             let _ = state.budget_manager.finalize_reservation(res_id).await;
         }
 
+        use std::future::Future;
         use std::pin::Pin;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::task::{Context, Poll};
@@ -392,6 +464,10 @@ pub async fn chat_completions(
             db: Option<std::sync::Arc<crate::node::storage::Database>>,
             prompt_tokens: i64,
             completed: std::sync::Arc<AtomicBool>,
+            deadline: std::time::Instant,
+            idle_sleep: Pin<Box<tokio::time::Sleep>>,
+            idle_timeout: std::time::Duration,
+            error_emitted: bool,
         }
 
         impl<S> Drop for MonitoredStream<S> {
@@ -421,8 +497,34 @@ pub async fn chat_completions(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Option<Self::Item>> {
+                // 1. Check overall request deadline
+                if std::time::Instant::now() >= self.deadline {
+                    if !self.error_emitted {
+                        self.error_emitted = true;
+                        self.completed.store(true, Ordering::SeqCst);
+                        if let Some(db) = &self.db {
+                            let req_store = db.request_store();
+                            let r_id = self.req_id.clone();
+                            tokio::spawn(async move {
+                                let _ = req_store
+                                    .mark_stream_interrupted(&r_id, "stream_total_timeout", None)
+                                    .await;
+                            });
+                        }
+                        let sse_err = "event: error\ndata: {\"error\":{\"message\":\"Upstream total request deadline exceeded\",\"type\":\"upstream_timeout_error\",\"code\":\"stream_total_timeout\"}}\n\n";
+                        return Poll::Ready(Some(Ok(bytes::Bytes::from(sse_err))));
+                    }
+                    return Poll::Ready(None);
+                }
+
+                // 2. Poll inner stream for new data
                 match Pin::new(&mut self.inner).poll_next(cx) {
-                    Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        // Reset idle sleep timer only upon actual data receipt!
+                        let next_wake = tokio::time::Instant::now() + self.idle_timeout;
+                        self.idle_sleep.as_mut().reset(next_wake);
+                        Poll::Ready(Some(Ok(bytes)))
+                    }
                     Poll::Ready(Some(Err(e))) => {
                         self.completed.store(true, Ordering::SeqCst);
                         if let Some(db) = &self.db {
@@ -451,7 +553,35 @@ pub async fn chat_completions(
                         }
                         Poll::Ready(None)
                     }
-                    Poll::Pending => Poll::Pending,
+                    Poll::Pending => {
+                        // 3. Poll idle sleep timer
+                        match self.idle_sleep.as_mut().poll(cx) {
+                            Poll::Ready(()) => {
+                                // Idle timeout elapsed without data
+                                if !self.error_emitted {
+                                    self.error_emitted = true;
+                                    self.completed.store(true, Ordering::SeqCst);
+                                    if let Some(db) = &self.db {
+                                        let req_store = db.request_store();
+                                        let r_id = self.req_id.clone();
+                                        tokio::spawn(async move {
+                                            let _ = req_store
+                                                .mark_stream_interrupted(
+                                                    &r_id,
+                                                    "stream_idle_timeout",
+                                                    None,
+                                                )
+                                                .await;
+                                        });
+                                    }
+                                    let sse_err = "event: error\ndata: {\"error\":{\"message\":\"Upstream stream idle timeout exceeded\",\"type\":\"upstream_timeout_error\",\"code\":\"stream_idle_timeout\"}}\n\n";
+                                    return Poll::Ready(Some(Ok(bytes::Bytes::from(sse_err))));
+                                }
+                                Poll::Ready(None)
+                            }
+                            Poll::Pending => Poll::Pending,
+                        }
+                    }
                 }
             }
         }
@@ -462,7 +592,14 @@ pub async fn chat_completions(
             db: db_opt,
             prompt_tokens: prompt_tokens_i64,
             completed: std::sync::Arc::new(AtomicBool::new(false)),
+            deadline: std::time::Instant::now() + total_timeout,
+            idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+            idle_timeout,
+            error_emitted: false,
         };
+
+        // MonitoredStream has assumed ownership; defuse dispatch guard
+        dispatch_guard.defuse();
 
         let body = axum::body::Body::from_stream(monitored_stream);
         let mut resp = body.into_response();
@@ -481,11 +618,25 @@ pub async fn chat_completions(
 
         Ok(resp)
     } else {
-        // Proxy the request non-streaming
-        let proxy_res = state
-            .proxy
-            .forward_chat_completion_with_headers(validated.raw, headers)
-            .await;
+        // Non-streaming execution with total request deadline
+        upstream_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+        let proxy_res = tokio::time::timeout(
+            total_timeout,
+            state
+                .proxy
+                .forward_chat_completion_with_headers(validated.raw, headers),
+        )
+        .await;
+
+        let proxy_res = match proxy_res {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(Error::UpstreamTimeout(format!(
+                    "Total request deadline exceeded after {:?}",
+                    total_timeout
+                )));
+            }
+        };
 
         match proxy_res {
             Ok(proxy_resp) => {
@@ -501,16 +652,19 @@ pub async fn chat_completions(
                     (p, c)
                 };
 
+                // Atomic non-streaming finalization
                 if let Some(db) = &state.db {
-                    let _ = db
-                        .request_store()
-                        .mark_completed(&internal_request_id, prompt_tok, comp_tok)
-                        .await;
+                    db.finalize_request_and_session(
+                        &internal_request_id,
+                        session_reservation_id.as_deref(),
+                        prompt_tok,
+                        comp_tok,
+                    )
+                    .await?;
                 }
 
-                if let Some(res_id) = &session_reservation_id {
-                    let _ = state.budget_manager.finalize_reservation(res_id).await;
-                }
+                // Successful durable finalization; defuse guard
+                dispatch_guard.defuse();
 
                 let mut resp = Json(proxy_resp).into_response();
                 resp.headers_mut().extend(response_headers);
@@ -527,22 +681,13 @@ pub async fn chat_completions(
                 Ok(resp)
             }
             Err(e) => {
-                // Confirmed upstream failure
-                if let Some(db) = &state.db {
-                    let _ = db
-                        .request_store()
-                        .mark_failed(&internal_request_id, "upstream_error", "proxy_forward")
-                        .await;
+                // If it is an explicit connection failure, the request was definitely not executed
+                if matches!(e, Error::UpstreamConnect(_)) {
+                    dispatch_guard
+                        .upstream_dispatched
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
-
-                // Release session reservation so user is not billed for failed execution
-                if let Some(res_id) = &session_reservation_id {
-                    let _ = state
-                        .budget_manager
-                        .release_reservation(res_id, "upstream_execution_failure")
-                        .await;
-                }
-
+                // Guard drop handles failure or reconciliation required
                 Err(e)
             }
         }
@@ -633,7 +778,18 @@ impl IntoResponse for Error {
             }
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
             Error::BudgetExhausted(_) => (StatusCode::PAYMENT_REQUIRED, self.to_string()),
-            Error::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            Error::Upstream(_) | Error::UpstreamConnect(_) => {
+                (StatusCode::BAD_GATEWAY, self.to_string())
+            }
+            Error::UpstreamTimeout(_) => {
+                let err_resp = crate::node::api::validation::OpenAiErrorResponse::new(
+                    self.to_string(),
+                    "upstream_timeout_error",
+                    None::<String>,
+                    Some("upstream_timeout"),
+                );
+                return err_resp.to_response(StatusCode::GATEWAY_TIMEOUT);
+            }
             Error::Lightning(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             Error::Validation(val_err) => {
                 return val_err.to_response(StatusCode::BAD_REQUEST);

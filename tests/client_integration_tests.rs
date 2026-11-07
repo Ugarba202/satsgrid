@@ -108,6 +108,7 @@ async fn test_end_to_end_client_node_integration() {
         pricing: PricingConfig::new(Satoshis(10)),
         upstream: UpstreamConfig {
             url: upstream_mock.uri(),
+            ..Default::default()
         },
         lightning: LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),

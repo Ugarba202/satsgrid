@@ -31,6 +31,12 @@ pub enum Error {
     #[error("Upstream inference error: {0}")]
     Upstream(String),
 
+    #[error("Upstream connection error: {0}")]
+    UpstreamConnect(String),
+
+    #[error("Upstream timeout: {0}")]
+    UpstreamTimeout(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 

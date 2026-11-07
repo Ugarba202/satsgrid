@@ -139,6 +139,169 @@ impl Database {
         crate::node::storage::request::RequestStore::new(self.pool.clone())
     }
 
+    /// Atomically finalize an inference request and its associated session reservation (if any)
+    /// in a single SQLite transaction.
+    ///
+    /// Ensures that an inference request cannot be marked completed without its session reservation
+    /// being finalized simultaneously, preventing split-brain inconsistencies between request logs
+    /// and the accounting ledger.
+    pub async fn finalize_request_and_session(
+        &self,
+        request_id: &str,
+        session_reservation_id: Option<&str>,
+        actual_prompt_tokens: Option<i64>,
+        actual_completion_tokens: Option<i64>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "Failed to acquire DB connection for atomic finalization: {}",
+                e
+            ))
+        })?;
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to begin transaction: {}", e)))?;
+
+        // 1. If a session reservation is associated, finalize it
+        if let Some(res_id) = session_reservation_id {
+            // Fetch reservation details
+            let fetch_res = r#"
+                SELECT session_id, reserved_sats, status
+                FROM session_reservations
+                WHERE id = ?1
+            "#;
+
+            let row: Option<(String, i64, String)> = sqlx::query_as(fetch_res)
+                .bind(res_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "Failed to fetch reservation in atomic finalization: {}",
+                        e
+                    ))
+                })?;
+
+            let (session_id_str, reserved_sats, status_str) = match row {
+                Some(r) => r,
+                None => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(Error::Internal(format!(
+                        "Reservation '{}' not found during atomic finalization",
+                        res_id
+                    )));
+                }
+            };
+
+            if status_str != "reserved" {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(Error::Internal(format!(
+                    "Cannot finalize reservation '{}': current status is '{}'",
+                    res_id, status_str
+                )));
+            }
+
+            // Update reservation status to finalized
+            let update_res = sqlx::query(
+                "UPDATE session_reservations SET status = 'finalized', finalized_at = ?1 WHERE id = ?2 AND status = 'reserved'",
+            )
+            .bind(now)
+            .bind(res_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to finalize reservation record: {}", e)))?;
+
+            if update_res.rows_affected() == 0 {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(Error::Internal(format!(
+                    "Concurrent modification during finalization of reservation '{}'",
+                    res_id
+                )));
+            }
+
+            // Update session balance: decrement reserved, increment spent
+            let update_session = r#"
+                UPDATE sessions
+                SET reserved_sats = reserved_sats - ?1,
+                    spent_sats = spent_sats + ?1,
+                    updated_at = ?2
+                WHERE id = ?3 AND reserved_sats >= ?1
+            "#;
+
+            sqlx::query(update_session)
+                .bind(reserved_sats)
+                .bind(now)
+                .bind(&session_id_str)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("Failed to update session spent balance: {}", e))
+                })?;
+
+            // Record accounting event: session_debit
+            let entry_uuid = uuid::Uuid::new_v4().to_string();
+            let ledger_query = r#"
+                INSERT INTO accounting_entries (
+                    entry_uuid, session_id, reservation_id, entry_type, amount_sats, created_at, description
+                ) VALUES (?1, ?2, ?3, 'session_debit', ?4, ?5, ?6)
+            "#;
+
+            let desc = format!(
+                "Finalized debit of {} sats for reservation {}",
+                reserved_sats, res_id
+            );
+            sqlx::query(ledger_query)
+                .bind(&entry_uuid)
+                .bind(&session_id_str)
+                .bind(res_id)
+                .bind(reserved_sats)
+                .bind(now)
+                .bind(desc)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("Failed to record debit ledger entry: {}", e))
+                })?;
+        }
+
+        // 2. Mark inference request completed
+        let query_req = r#"
+            UPDATE inference_requests
+            SET status = 'completed',
+                completed_at = ?1,
+                actual_prompt_tokens = ?2,
+                actual_completion_tokens = ?3
+            WHERE id = ?4 AND status IN ('processing', 'stream_interrupted')
+        "#;
+
+        let res_req = sqlx::query(query_req)
+            .bind(now)
+            .bind(actual_prompt_tokens)
+            .bind(actual_completion_tokens)
+            .bind(request_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to mark request completed: {}", e)))?;
+
+        if res_req.rows_affected() == 0 {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::Internal(format!(
+                "Cannot mark request '{}' completed: not in processing or stream_interrupted state",
+                request_id
+            )));
+        }
+
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to commit atomic finalization: {}", e)))?;
+
+        Ok(())
+    }
+
     /// Verify that essential PRAGMAs (foreign keys, WAL mode) are actively enforced.
     async fn verify_pragmas(pool: &Pool<Sqlite>) -> Result<()> {
         let fk: i32 = sqlx::query_scalar("PRAGMA foreign_keys")

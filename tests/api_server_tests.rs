@@ -26,6 +26,7 @@ fn setup_app() -> axum::Router {
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: "http://localhost:8080".to_string(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),
@@ -116,6 +117,7 @@ async fn test_models_endpoint_dynamic_upstream() {
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: mock_server.uri(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),
@@ -219,6 +221,7 @@ async fn test_chat_completions_pay_per_request_flow() {
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: mock_server.uri(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),
@@ -373,6 +376,7 @@ async fn test_api_e2e_flow_with_budget_debit() {
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: mock_server.uri(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),
@@ -504,6 +508,7 @@ async fn test_chat_completions_capability_authorization() {
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: "http://localhost:8080".to_string(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),

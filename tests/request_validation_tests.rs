@@ -61,6 +61,7 @@ async fn setup_test_context(max_bytes: usize, max_completion_tokens: usize) -> T
         pricing: PricingConfig::new(Satoshis(10)),
         upstream: UpstreamConfig {
             url: mock_server.uri(),
+            ..Default::default()
         },
         data_dir: dir.path().to_string_lossy().to_string(),
         ..Default::default()

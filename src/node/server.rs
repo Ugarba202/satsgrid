@@ -93,7 +93,11 @@ impl SatsGridServer {
         let macaroon_key = Self::load_or_generate_macaroon_key(&self.config.data_dir)?;
         let admin_token = Self::load_or_generate_admin_token(&self.config)?;
 
-        let proxy = OpenAiProxy::new(self.config.upstream.url.clone());
+        let proxy = OpenAiProxy::new_with_timeouts(
+            self.config.upstream.url.clone(),
+            std::time::Duration::from_secs(self.config.upstream.connect_timeout_secs),
+            std::time::Duration::from_secs(self.config.upstream.response_header_timeout_secs),
+        );
 
         let lightning_backend: Arc<dyn LightningBackend> = match self.config.lightning.backend {
             LightningBackendType::Mock => {

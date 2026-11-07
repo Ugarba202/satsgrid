@@ -180,6 +180,34 @@ impl RequestStore {
         Ok(())
     }
 
+    /// Fetch an inference request by payment hash.
+    pub async fn get_request_by_payment_hash(
+        &self,
+        payment_hash: &PaymentHash,
+    ) -> Result<Option<InferenceRequestRecord>> {
+        let query = r#"
+            SELECT id
+            FROM inference_requests
+            WHERE payment_hash = ?1
+        "#;
+
+        let req_id: Option<String> = sqlx::query_scalar(query)
+            .bind(&payment_hash.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to fetch inference request by payment hash: {}",
+                    e
+                ))
+            })?;
+
+        match req_id {
+            Some(id) => self.get_request(&id).await,
+            None => Ok(None),
+        }
+    }
+
     /// Fetch an inference request by ID.
     pub async fn get_request(&self, id: &str) -> Result<Option<InferenceRequestRecord>> {
         let query = r#"

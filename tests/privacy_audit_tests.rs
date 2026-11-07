@@ -46,6 +46,7 @@ fn setup_app() -> axum::Router {
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: "http://localhost:8080".to_string(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),

@@ -42,15 +42,52 @@ impl Default for ServerConfig {
     }
 }
 
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_response_header_timeout_secs() -> u64 {
+    60
+}
+
+fn default_stream_idle_timeout_secs() -> u64 {
+    30
+}
+
+fn default_total_request_timeout_secs() -> u64 {
+    600
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     pub url: String,
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    #[serde(default = "default_response_header_timeout_secs")]
+    pub response_header_timeout_secs: u64,
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    #[serde(default = "default_total_request_timeout_secs")]
+    pub total_request_timeout_secs: u64,
+}
+
+impl UpstreamConfig {
+    pub fn new(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            ..Default::default()
+        }
+    }
 }
 
 impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
             url: "http://127.0.0.1:11434".to_string(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            response_header_timeout_secs: default_response_header_timeout_secs(),
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            total_request_timeout_secs: default_total_request_timeout_secs(),
         }
     }
 }
@@ -189,7 +226,34 @@ impl NodeConfig {
         let config: Self = toml::from_str(&contents).map_err(|e| {
             crate::common::error::Error::Config(format!("Failed to parse TOML config: {}", e))
         })?;
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn validate(&self) -> crate::common::error::Result<()> {
+        if self.upstream.connect_timeout_secs == 0 {
+            return Err(crate::common::error::Error::Config(
+                "upstream.connect_timeout_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.upstream.response_header_timeout_secs < self.upstream.connect_timeout_secs {
+            return Err(crate::common::error::Error::Config(
+                "upstream.response_header_timeout_secs cannot be less than connect_timeout_secs"
+                    .to_string(),
+            ));
+        }
+        if self.upstream.stream_idle_timeout_secs == 0 {
+            return Err(crate::common::error::Error::Config(
+                "upstream.stream_idle_timeout_secs must be greater than 0".to_string(),
+            ));
+        }
+        if self.upstream.total_request_timeout_secs < self.upstream.response_header_timeout_secs {
+            return Err(crate::common::error::Error::Config(
+                "upstream.total_request_timeout_secs cannot be less than response_header_timeout_secs"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 

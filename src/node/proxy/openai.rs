@@ -8,24 +8,39 @@ use std::time::Duration;
 pub struct OpenAiProxy {
     client: Client,
     upstream_url: String,
+    connect_timeout: Duration,
+    header_timeout: Duration,
 }
 
 impl OpenAiProxy {
     pub fn new(upstream_url: impl Into<String>) -> Self {
+        Self::new_with_timeouts(
+            upstream_url,
+            Duration::from_secs(10),
+            Duration::from_secs(60),
+        )
+    }
+
+    pub fn new_with_timeouts(
+        upstream_url: impl Into<String>,
+        connect_timeout: Duration,
+        header_timeout: Duration,
+    ) -> Self {
+        let client = Client::builder()
+            .connect_timeout(connect_timeout)
+            .build()
+            .unwrap_or_default();
+
         Self {
-            client: Client::new(),
+            client,
             upstream_url: upstream_url.into(),
+            connect_timeout,
+            header_timeout,
         }
     }
 
     pub fn new_with_timeout(upstream_url: impl Into<String>, timeout: Duration) -> Self {
-        Self {
-            client: Client::builder()
-                .timeout(timeout)
-                .build()
-                .unwrap_or_default(),
-            upstream_url: upstream_url.into(),
-        }
+        Self::new_with_timeouts(upstream_url, timeout, timeout)
     }
 
     pub fn client(&self) -> &Client {
@@ -34,6 +49,14 @@ impl OpenAiProxy {
 
     pub fn upstream_url(&self) -> &str {
         &self.upstream_url
+    }
+
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    pub fn header_timeout(&self) -> Duration {
+        self.header_timeout
     }
 
     pub async fn forward_chat_completion(&self, request: Value) -> Result<Value> {
@@ -62,23 +85,32 @@ impl OpenAiProxy {
             req_headers.insert("content-type", "application/json".parse().unwrap());
         }
 
-        let resp = self
+        let send_future = self
             .client
             .post(&url)
             .headers(req_headers)
             .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    crate::common::error::Error::Upstream(format!("Upstream timeout: {}", e))
-                } else {
-                    crate::common::error::Error::Upstream(format!(
-                        "Upstream connection error: {}",
+            .send();
+        let resp = match tokio::time::timeout(self.header_timeout, send_future).await {
+            Ok(send_res) => send_res.map_err(|e| {
+                if e.is_connect() {
+                    crate::common::error::Error::UpstreamConnect(format!(
+                        "Upstream connection establishment failed: {}",
                         e
                     ))
+                } else if e.is_timeout() {
+                    crate::common::error::Error::UpstreamTimeout(format!("Upstream timeout: {}", e))
+                } else {
+                    crate::common::error::Error::Upstream(format!("Upstream request error: {}", e))
                 }
-            })?;
+            })?,
+            Err(_) => {
+                return Err(crate::common::error::Error::UpstreamTimeout(format!(
+                    "Upstream response header timeout exceeded after {:?}",
+                    self.header_timeout
+                )));
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -131,17 +163,34 @@ impl OpenAiProxy {
     ) -> Result<impl Stream<Item = Result<bytes::Bytes>>> {
         let url = format!("{}/v1/chat/completions", self.upstream_url);
 
-        let resp = self
+        let send_future = self
             .client
             .post(&url)
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
             .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                crate::common::error::Error::Upstream(format!("Upstream stream error: {}", e))
-            })?;
+            .send();
+
+        let resp = match tokio::time::timeout(self.header_timeout, send_future).await {
+            Ok(send_res) => send_res.map_err(|e| {
+                if e.is_connect() {
+                    crate::common::error::Error::UpstreamConnect(format!(
+                        "Upstream connection establishment failed: {}",
+                        e
+                    ))
+                } else if e.is_timeout() {
+                    crate::common::error::Error::UpstreamTimeout(format!("Upstream timeout: {}", e))
+                } else {
+                    crate::common::error::Error::Upstream(format!("Upstream request error: {}", e))
+                }
+            })?,
+            Err(_) => {
+                return Err(crate::common::error::Error::UpstreamTimeout(format!(
+                    "Upstream response header timeout exceeded after {:?}",
+                    self.header_timeout
+                )));
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {

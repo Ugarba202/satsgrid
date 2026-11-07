@@ -760,6 +760,7 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
         pricing: PricingConfig::new(Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: mock_server.uri(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: dir.path().to_string_lossy().to_string(),
