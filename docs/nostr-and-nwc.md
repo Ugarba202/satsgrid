@@ -47,18 +47,18 @@ Callers can settle L402 challenges completely automatically without manual copy-
 
 ### Option A: CLI Flag `--payer-nwc-uri`
 ```bash
-infernos call \
+satsgrid call \
   --node http://127.0.0.1:8080 \
   --model llama3.2 \
   --prompt "Explain Bitcoin in one sentence" \
   --payer-nwc-uri "nostr+walletconnect://<wallet-pubkey>?relay=wss%3A%2F%2Frelay.damus.io&secret=<client-secret>"
 ```
 
-### Option B: Environment Variable `INFERNOS_PAYER_NWC_URI`
+### Option B: Environment Variable `SATSGRID_PAYER_NWC_URI`
 For autonomous background agents, configure the environment variable:
 ```bash
-export INFERNOS_PAYER_NWC_URI="nostr+walletconnect://<wallet-pubkey>?relay=wss%3A%2F%2Frelay.damus.io&secret=<client-secret>"
-infernos call --model llama3.2 --prompt "Analyze system metrics"
+export SATSGRID_PAYER_NWC_URI="nostr+walletconnect://<wallet-pubkey>?relay=wss%3A%2F%2Frelay.damus.io&secret=<client-secret>"
+satsgrid call --model llama3.2 --prompt "Analyze system metrics"
 ```
 
 When configured, the SatsGrid CLI banner will output:
@@ -139,16 +139,16 @@ Callers and agents can discover live nodes querying one or more Nostr relays:
 
 ```bash
 # Discover all active SatsGrid nodes across default relays
-infernos discover
+satsgrid discover
 
 # Filter by a specific model (e.g. llama3.2)
-infernos discover --model llama3.2
+satsgrid discover --model llama3.2
 
 # Query custom relays with custom timeout
-infernos discover --relay wss://relay.damus.io --relay wss://nos.lol --timeout-secs 10
+satsgrid discover --relay wss://relay.damus.io --relay wss://nos.lol --timeout-secs 10
 
 # Output machine-readable JSON (ideal for autonomous agent scripts)
-infernos discover --model llama3.2 --json
+satsgrid discover --model llama3.2 --json
 ```
 
 Sample output:
@@ -157,7 +157,7 @@ Discovered 2 active SatsGrid node(s):
 
 NODE NAME            ENDPOINT                       MODELS                   PRICE (SATS)    NETWORK   
 ---------------------------------------------------------------------------------------------------------
-Llama Alpha          https://alpha.infernos.org     llama3.2, mistral        10              mainnet   
+Llama Alpha          https://alpha.satsgrid.org     llama3.2, mistral        10              mainnet   
 GPU Hub Regtest      http://127.0.0.1:8080          llama3.2, deepseek-r1    5               regtest   
 ---------------------------------------------------------------------------------------------------------
 ```
@@ -167,7 +167,7 @@ GPU Hub Regtest      http://127.0.0.1:8080          llama3.2, deepseek-r1    5  
 #### Option A: Automatic Broadcast on Node Startup
 Add `--announce` when starting the node:
 ```bash
-infernos node start --config config/node.toml --announce
+satsgrid node start --config config/node.toml --announce
 ```
 
 Or enable it permanently in `config/node.toml`:
@@ -183,10 +183,10 @@ public_url = "https://node.example.com"
 Broadcast node availability on demand:
 ```bash
 # Announce using node.toml configuration
-infernos node announce --config config/node.toml
+satsgrid node announce --config config/node.toml
 
 # Announce to specific relays with custom nsec key
-infernos node announce --config config/node.toml --relay wss://relay.damus.io --nsec nsec1...
+satsgrid node announce --config config/node.toml --relay wss://relay.damus.io --nsec nsec1...
 ```
 
 ---
