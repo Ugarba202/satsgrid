@@ -7,6 +7,7 @@ use uuid::Uuid;
 /// Status of a persistent session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionStatus {
+    PendingPayment,
     Active,
     Exhausted,
     Expired,
@@ -16,6 +17,7 @@ pub enum SessionStatus {
 impl SessionStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::PendingPayment => "pending_payment",
             Self::Active => "active",
             Self::Exhausted => "exhausted",
             Self::Expired => "expired",
@@ -29,6 +31,7 @@ impl FromStr for SessionStatus {
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
         match s {
+            "pending_payment" => Ok(Self::PendingPayment),
             "active" => Ok(Self::Active),
             "exhausted" => Ok(Self::Exhausted),
             "expired" => Ok(Self::Expired),
@@ -99,13 +102,31 @@ pub enum SessionReservationResult {
     NotFound,
     /// Session is expired.
     Expired { expires_at: i64 },
-    /// Session is inactive (exhausted or closed).
+    /// Session is inactive (exhausted, pending_payment, or closed).
     Inactive { status: SessionStatus },
     /// Available budget is insufficient.
     InsufficientBudget {
         requested: Satoshis,
         available: Satoshis,
     },
+}
+
+/// Outcome of attempting to activate a pending-payment session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SessionActivationResult {
+    /// Successfully transitioned from pending_payment to active and credited funding.
+    Activated { total_budget: Satoshis },
+    /// Session is already active or in another terminal status.
+    AlreadyActive {
+        status: SessionStatus,
+        remaining: Satoshis,
+    },
+    /// Session record was not found in storage.
+    NotFound,
+    /// Session has already expired before activation.
+    Expired { expires_at: i64 },
+    /// The supplied payment hash does not match the session's recorded payment hash.
+    PaymentHashMismatch,
 }
 
 type SessionRow = (
@@ -132,7 +153,187 @@ impl SessionStore {
         Self { pool }
     }
 
-    /// Create and fund a new session in persistent storage.
+    /// Create a pending payment challenge for a session in persistent storage.
+    ///
+    /// Inserts a `sessions` record with `status = 'pending_payment'`, `remaining_sats = 0`.
+    /// Zero ledger entries are recorded until settlement is confirmed.
+    pub async fn create_pending_session(
+        &self,
+        session_id: &SessionId,
+        payment_hash: Option<&PaymentHash>,
+        total_budget: Satoshis,
+        expires_at: i64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+
+        let insert_query = r#"
+            INSERT INTO sessions (
+                id, payment_hash, total_budget_sats, remaining_sats,
+                reserved_sats, spent_sats, status, created_at, expires_at, updated_at
+            ) VALUES (?1, ?2, ?3, 0, 0, 0, 'pending_payment', ?4, ?5, ?4)
+        "#;
+
+        sqlx::query(insert_query)
+            .bind(session_id.0.to_string())
+            .bind(payment_hash.map(|h| h.0.as_str()))
+            .bind(total_budget.0 as i64)
+            .bind(now)
+            .bind(expires_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref db_err) if db_err.is_unique_violation() => {
+                    Error::Internal(format!(
+                        "Session or funding payment hash already exists: {}",
+                        db_err
+                    ))
+                }
+                _ => Error::Internal(format!("Failed to insert pending session: {}", e)),
+            })?;
+
+        Ok(())
+    }
+
+    /// Atomically activate a pending session upon verified payment settlement.
+    ///
+    /// Validates that the supplied `payment_hash` matches the session's recorded payment hash.
+    /// Transitions `status = 'pending_payment'` -> `'active'`, credits `remaining_sats = total_budget_sats`,
+    /// and records the append-only `session_funding` ledger entry exactly once.
+    pub async fn activate_session(
+        &self,
+        session_id: &SessionId,
+        payment_hash: &PaymentHash,
+    ) -> Result<SessionActivationResult> {
+        let now = chrono::Utc::now().timestamp();
+
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "Failed to acquire connection for session activation: {}",
+                e
+            ))
+        })?;
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to begin immediate transaction for activation: {}",
+                    e
+                ))
+            })?;
+
+        let select_query = r#"
+            SELECT payment_hash, total_budget_sats, remaining_sats, expires_at, status
+            FROM sessions
+            WHERE id = ?1
+        "#;
+
+        let row: Option<(Option<String>, i64, i64, i64, String)> = sqlx::query_as(select_query)
+            .bind(session_id.0.to_string())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("Failed to query session for activation: {}", e))
+            })?;
+
+        let (stored_payment_hash, total_budget, remaining, expires_at, status_str) = match row {
+            Some(r) => r,
+            None => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Ok(SessionActivationResult::NotFound);
+            }
+        };
+
+        // Enforce explicit payment-hash binding:
+        // Must match stored payment hash exactly; missing or mismatched hash is rejected.
+        match stored_payment_hash {
+            Some(ref h) if h.eq_ignore_ascii_case(&payment_hash.0) => {}
+            _ => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Ok(SessionActivationResult::PaymentHashMismatch);
+            }
+        }
+
+        let status = SessionStatus::from_str(&status_str)
+            .map_err(|_| Error::Internal("Invalid session status in DB".to_string()))?;
+
+        if status != SessionStatus::PendingPayment {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Ok(SessionActivationResult::AlreadyActive {
+                status,
+                remaining: Satoshis(remaining as u64),
+            });
+        }
+
+        if now >= expires_at {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Ok(SessionActivationResult::Expired { expires_at });
+        }
+
+        // Transition session to active and credit budget
+        let update_query = r#"
+            UPDATE sessions
+            SET status = 'active', remaining_sats = total_budget_sats, updated_at = ?1
+            WHERE id = ?2 AND status = 'pending_payment'
+        "#;
+
+        let result = sqlx::query(update_query)
+            .bind(now)
+            .bind(session_id.0.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to activate pending session: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            // Concurrent activation won
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Ok(SessionActivationResult::AlreadyActive {
+                status: SessionStatus::Active,
+                remaining: Satoshis(total_budget as u64),
+            });
+        }
+
+        // Record initial session_funding ledger entry
+        let entry_uuid = Uuid::new_v4().to_string();
+        let ledger_query = r#"
+            INSERT INTO accounting_entries (
+                entry_uuid, session_id, reservation_id, entry_type, amount_sats, created_at, description
+            ) VALUES (?1, ?2, NULL, 'session_funding', ?3, ?4, ?5)
+        "#;
+
+        let desc = format!("Initial session funding of {} sats", total_budget);
+        sqlx::query(ledger_query)
+            .bind(&entry_uuid)
+            .bind(session_id.0.to_string())
+            .bind(total_budget)
+            .bind(now)
+            .bind(desc)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to record session activation funding ledger entry: {}",
+                    e
+                ))
+            })?;
+
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to commit session activation transaction: {}",
+                    e
+                ))
+            })?;
+
+        Ok(SessionActivationResult::Activated {
+            total_budget: Satoshis(total_budget as u64),
+        })
+    }
+
+    /// Create and fund a new session in persistent storage immediately.
     ///
     /// Inserts a `sessions` record and an append-only `accounting_entries` record for session funding.
     pub async fn create_session(
@@ -315,7 +516,7 @@ impl SessionStore {
             .map_err(|_| Error::Internal("Invalid session status in DB".to_string()))?;
 
         // 4. Check expiration
-        if now > expires_at {
+        if now >= expires_at {
             // Mark session expired in database
             let _ = sqlx::query("UPDATE sessions SET status = 'expired', updated_at = ?1 WHERE id = ?2 AND status != 'expired'")
                 .bind(now)

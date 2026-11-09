@@ -48,6 +48,185 @@ async fn test_session_creation_and_retrieval() {
 }
 
 #[tokio::test]
+async fn test_pending_session_creation_and_atomic_activation() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.session_store();
+
+    let session_id = SessionId(Uuid::new_v4());
+    let payment_hash =
+        PaymentHash("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789".to_string());
+    let budget = Satoshis(100);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    // 1. Create pending challenge
+    store
+        .create_pending_session(&session_id, Some(&payment_hash), budget, expires_at)
+        .await
+        .expect("create pending session");
+
+    let record = store
+        .get_session(&session_id)
+        .await
+        .expect("query session")
+        .expect("session must exist");
+
+    assert_eq!(record.status, SessionStatus::PendingPayment);
+    assert_eq!(record.remaining_sats, Satoshis(0));
+    assert_eq!(record.total_budget_sats, Satoshis(100));
+
+    // Zero accounting entries while pending!
+    let entries = store
+        .get_accounting_entries(&session_id)
+        .await
+        .expect("fetch entries");
+    assert_eq!(entries.len(), 0);
+
+    // Attempting to reserve from pending session must fail with Inactive
+    let res = store
+        .reserve_budget(&session_id, Satoshis(10), "res-1")
+        .await
+        .expect("reserve result");
+    assert_eq!(
+        res,
+        SessionReservationResult::Inactive {
+            status: SessionStatus::PendingPayment
+        }
+    );
+
+    // 2. Activate upon payment
+    let act = store
+        .activate_session(&session_id, &payment_hash)
+        .await
+        .expect("activate session");
+    assert_eq!(
+        act,
+        satsgrid::node::storage::SessionActivationResult::Activated {
+            total_budget: Satoshis(100)
+        }
+    );
+
+    let active_rec = store
+        .get_session(&session_id)
+        .await
+        .expect("query session")
+        .expect("session must exist");
+    assert_eq!(active_rec.status, SessionStatus::Active);
+    assert_eq!(active_rec.remaining_sats, Satoshis(100));
+
+    // Exactly one session_funding ledger entry!
+    let entries = store
+        .get_accounting_entries(&session_id)
+        .await
+        .expect("fetch entries");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].1, "session_funding");
+    assert_eq!(entries[0].2, 100);
+
+    // Duplicate activation must be idempotent and not add funding!
+    let act2 = store
+        .activate_session(&session_id, &payment_hash)
+        .await
+        .expect("duplicate activation");
+    assert_eq!(
+        act2,
+        satsgrid::node::storage::SessionActivationResult::AlreadyActive {
+            status: SessionStatus::Active,
+            remaining: Satoshis(100),
+        }
+    );
+
+    let entries_after = store
+        .get_accounting_entries(&session_id)
+        .await
+        .expect("fetch entries");
+    assert_eq!(entries_after.len(), 1); // Still exactly 1 entry!
+}
+
+#[tokio::test]
+async fn test_concurrent_session_activation_exactly_once() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = Arc::new(db.session_store());
+
+    let session_id = SessionId(Uuid::new_v4());
+    let payment_hash =
+        PaymentHash("abcdefabcdef0123456789abcdef0123456789abcdef0123456789abcdef0123".to_string());
+    let budget = Satoshis(250);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    // Create pending session
+    store
+        .create_pending_session(&session_id, Some(&payment_hash), budget, expires_at)
+        .await
+        .expect("create pending session");
+
+    // Spawn 10 concurrent activation attempts
+    let mut tasks = Vec::new();
+    for _ in 0..10 {
+        let store_clone = Arc::clone(&store);
+        let sid = session_id.clone();
+        let phash = payment_hash.clone();
+        tasks.push(tokio::spawn(async move {
+            store_clone.activate_session(&sid, &phash).await
+        }));
+    }
+
+    let mut activated_count = 0;
+    let mut already_active_count = 0;
+
+    for task in tasks {
+        let res = task.await.expect("task join").expect("activate result");
+        match res {
+            satsgrid::node::storage::SessionActivationResult::Activated { total_budget } => {
+                assert_eq!(total_budget, Satoshis(250));
+                activated_count += 1;
+            }
+            satsgrid::node::storage::SessionActivationResult::AlreadyActive {
+                status,
+                remaining,
+            } => {
+                assert_eq!(status, SessionStatus::Active);
+                assert_eq!(remaining, Satoshis(250));
+                already_active_count += 1;
+            }
+            other => panic!("Unexpected activation result: {:?}", other),
+        }
+    }
+
+    // Exactly 1 caller activated, and 9 callers received AlreadyActive
+    assert_eq!(
+        activated_count, 1,
+        "Exactly one task must activate the session"
+    );
+    assert_eq!(
+        already_active_count, 9,
+        "9 tasks must observe already active"
+    );
+
+    // Accounting entries must contain exactly 1 session_funding entry
+    let entries = store
+        .get_accounting_entries(&session_id)
+        .await
+        .expect("get entries");
+    assert_eq!(entries.len(), 1, "Exactly 1 funding entry must be created");
+    assert_eq!(entries[0].1, "session_funding");
+    assert_eq!(entries[0].2, 250);
+
+    // Session balance must reflect active and full budget
+    let session = store
+        .get_session(&session_id)
+        .await
+        .expect("get session")
+        .expect("session must exist");
+    assert_eq!(session.status, SessionStatus::Active);
+    assert_eq!(session.remaining_sats, Satoshis(250));
+    assert_eq!(session.total_budget_sats, Satoshis(250));
+    assert_eq!(session.reserved_sats, Satoshis(0));
+    assert_eq!(session.spent_sats, Satoshis(0));
+}
+
+#[tokio::test]
 async fn test_session_persistence_across_reconnect() {
     let dir = tempdir().expect("create tempdir");
     let db_path = dir.path().join("persist_session.db");
@@ -643,6 +822,11 @@ async fn test_existing_session_api_regression() {
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("admin123".to_string()),
         db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);
@@ -677,7 +861,7 @@ async fn test_existing_session_api_regression() {
     let session_id = extracted_id.expect("session caveat present");
     assert_eq!(extracted_budget, Some(Satoshis(350)));
 
-    // Verify session was persisted in SQLite
+    // Verify session was persisted in SQLite as pending_payment with 0 remaining_sats
     let record = db
         .session_store()
         .get_session(&session_id)
@@ -685,6 +869,6 @@ async fn test_existing_session_api_regression() {
         .unwrap()
         .expect("session must exist in SQLite");
     assert_eq!(record.total_budget_sats, Satoshis(350));
-    assert_eq!(record.remaining_sats, Satoshis(350));
-    assert_eq!(record.status, SessionStatus::Active);
+    assert_eq!(record.remaining_sats, Satoshis(0));
+    assert_eq!(record.status, SessionStatus::PendingPayment);
 }
