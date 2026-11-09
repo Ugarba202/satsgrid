@@ -37,6 +37,12 @@ pub enum Error {
     #[error("Upstream timeout: {0}")]
     UpstreamTimeout(String),
 
+    #[error("Node capacity exceeded: {0}")]
+    ServerOverloaded(String),
+
+    #[error("Session concurrency limit exceeded: {0}")]
+    ConcurrencyLimitExceeded(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 

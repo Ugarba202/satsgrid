@@ -99,6 +99,12 @@ impl SatsGridServer {
             std::time::Duration::from_secs(self.config.upstream.response_header_timeout_secs),
         );
 
+        let concurrency_manager = Arc::new(crate::node::concurrency::ConcurrencyManager::new(
+            self.config.concurrency.max_concurrent_requests,
+            self.config.concurrency.max_concurrent_per_session,
+            self.config.concurrency.admission_timeout_secs,
+        ));
+
         let lightning_backend: Arc<dyn LightningBackend> = match self.config.lightning.backend {
             LightningBackendType::Mock => {
                 tracing::info!("Initializing Mock Lightning backend");
@@ -144,6 +150,7 @@ impl SatsGridServer {
             stats: Arc::new(crate::node::api::NodeStats::default()),
             admin_token: Arc::new(admin_token),
             db: Some(Arc::new(db)),
+            concurrency_manager,
         };
 
         let app = create_routes(state).layer(

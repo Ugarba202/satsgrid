@@ -194,6 +194,38 @@ impl Default for DiscoveryConfig {
     }
 }
 
+fn default_max_concurrent_requests() -> usize {
+    32
+}
+
+fn default_max_concurrent_per_session() -> usize {
+    4
+}
+
+fn default_admission_timeout_secs() -> u64 {
+    0
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrencyConfig {
+    #[serde(default = "default_max_concurrent_requests")]
+    pub max_concurrent_requests: usize,
+    #[serde(default = "default_max_concurrent_per_session")]
+    pub max_concurrent_per_session: usize,
+    #[serde(default = "default_admission_timeout_secs")]
+    pub admission_timeout_secs: u64,
+}
+
+impl Default for ConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_requests: default_max_concurrent_requests(),
+            max_concurrent_per_session: default_max_concurrent_per_session(),
+            admission_timeout_secs: default_admission_timeout_secs(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct NodeConfig {
     #[serde(default)]
@@ -206,6 +238,8 @@ pub struct NodeConfig {
     pub lightning: LightningConfig,
     #[serde(default)]
     pub discovery: DiscoveryConfig,
+    #[serde(default)]
+    pub concurrency: ConcurrencyConfig,
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
 }
@@ -250,6 +284,22 @@ impl NodeConfig {
         if self.upstream.total_request_timeout_secs < self.upstream.response_header_timeout_secs {
             return Err(crate::common::error::Error::Config(
                 "upstream.total_request_timeout_secs cannot be less than response_header_timeout_secs"
+                    .to_string(),
+            ));
+        }
+        if self.concurrency.max_concurrent_requests == 0 {
+            return Err(crate::common::error::Error::Config(
+                "concurrency.max_concurrent_requests must be greater than 0".to_string(),
+            ));
+        }
+        if self.concurrency.max_concurrent_per_session == 0 {
+            return Err(crate::common::error::Error::Config(
+                "concurrency.max_concurrent_per_session must be greater than 0".to_string(),
+            ));
+        }
+        if self.concurrency.max_concurrent_per_session > self.concurrency.max_concurrent_requests {
+            return Err(crate::common::error::Error::Config(
+                "concurrency.max_concurrent_per_session cannot exceed max_concurrent_requests"
                     .to_string(),
             ));
         }

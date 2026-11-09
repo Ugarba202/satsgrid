@@ -3,6 +3,7 @@ pub mod routes;
 pub mod validation;
 
 use crate::config::schema::{NodeConfig, PricingConfig};
+use crate::node::concurrency::ConcurrencyManager;
 use crate::node::gate::{MacaroonService, SessionBudgetManager};
 use crate::node::lightning::backend::LightningBackend;
 use crate::node::pricing::PricingCalculator;
@@ -29,6 +30,7 @@ pub struct AppState {
     pub stats: Arc<NodeStats>,
     pub admin_token: Arc<String>,
     pub db: Option<Arc<Database>>,
+    pub concurrency_manager: Arc<ConcurrencyManager>,
 }
 
 impl AppState {
