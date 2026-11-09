@@ -82,6 +82,11 @@ async fn setup_test_context(max_bytes: usize, max_completion_tokens: usize) -> T
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
         db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);

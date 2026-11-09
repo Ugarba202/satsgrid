@@ -36,3 +36,14 @@ This directory contains the complete technical audit reports and implementation 
 - **[16-task4-security-verification.md](16-task4-security-verification.md)**: Independent security verification for Task 4 (dispatch boundary, SSE stream handling, and recovery audit).
 - **[17-task4-corrective-implementation.md](17-task4-corrective-implementation.md)**: Implementation report for Task 4A (Monitored SSE stream delivery with drop guards and database idempotency constraints).
 - **[18-public-repository-readiness.md](18-public-repository-readiness.md)**: Final public repository hygiene, secret scanning, and readiness audit report.
+
+---
+
+## 3. Phase 2 Hardening & Verification Records (19 – 21)
+
+> [!IMPORTANT]
+> Reports 19 through 21 document the production hardening implementations across Request Validation, Upstream Timeouts & Cancellation, and Concurrency Protection.
+
+- **[19-request-validation-implementation.md](19-request-validation-implementation.md)**: Implementation report for Task 5 (Schema validation, payload bounds, sanitized forwarding, and prompt leak defense).
+- **[20-timeouts-cancellation-implementation.md](20-timeouts-cancellation-implementation.md)**: Implementation report for Task 6 (Configurable timeouts, stream idle detection, and dispatch cancellation guards).
+- **[21-concurrency-protection-implementation.md](21-concurrency-protection-implementation.md)**: Implementation and audit report for Task 7 (Global and per-session concurrency protection, streaming permit ownership, and idempotency collision rollback).

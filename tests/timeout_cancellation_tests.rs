@@ -69,6 +69,11 @@ async fn setup_test_context(upstream_config: UpstreamConfig) -> TestContext {
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
         db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);
@@ -230,6 +235,11 @@ async fn test_upstream_connect_failure_releases_session_reservation() {
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
         db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);
@@ -375,6 +385,11 @@ async fn test_sse_streaming_idle_timeout_emits_error_and_no_done() {
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
         db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);
@@ -680,6 +695,11 @@ async fn test_streaming_total_deadline_terminates_active_chunks() {
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
         db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);

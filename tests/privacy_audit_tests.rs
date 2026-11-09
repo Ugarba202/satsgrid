@@ -69,6 +69,11 @@ fn setup_app() -> axum::Router {
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
         db: None,
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config_arc.concurrency.max_concurrent_requests,
+            config_arc.concurrency.max_concurrent_per_session,
+            config_arc.concurrency.admission_timeout_secs,
+        )),
     };
 
     create_routes(state).layer(
