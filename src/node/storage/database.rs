@@ -129,6 +129,11 @@ impl Database {
         PaymentStore::new(self.pool.clone())
     }
 
+    /// Get an `InvoiceStore` handle for PayGuard invoice tracking.
+    pub fn invoice_store(&self) -> crate::node::storage::invoice::InvoiceStore {
+        crate::node::storage::invoice::InvoiceStore::new(self.pool.clone())
+    }
+
     /// Get a `SessionStore` handle for persistent session budget operations.
     pub fn session_store(&self) -> crate::node::storage::session::SessionStore {
         crate::node::storage::session::SessionStore::new(self.pool.clone())

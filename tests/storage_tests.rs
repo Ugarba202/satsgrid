@@ -542,3 +542,176 @@ async fn test_migration_failure_safety_and_rollback() {
         "Child table and data must be intact after rollback"
     );
 }
+
+#[tokio::test]
+async fn test_migration_7_invoices_schema_and_integrity() {
+    use satsgrid::common::types::{PaymentHash, Satoshis, SessionId};
+    use satsgrid::node::storage::invoice::{InvoicePurpose, InvoiceStatus};
+    use uuid::Uuid;
+
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let pool = db.pool();
+
+    // 1. Verify migration 7 is recorded in _satsgrid_migrations
+    let v7_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _satsgrid_migrations WHERE version = 7")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(v7_count, 1, "Migration 7 must be recorded");
+
+    // 2. Verify invoices table exists and columns are queryable
+    let inv_store = db.invoice_store();
+    let payment_hash =
+        PaymentHash("1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff".to_string());
+    let bolt11 = "lnbc100u1testinvoice".to_string();
+    let amount = Satoshis(100);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    inv_store
+        .create_invoice(
+            &payment_hash,
+            &bolt11,
+            amount,
+            InvoicePurpose::PayPerRequest,
+            None,
+            expires_at,
+        )
+        .await
+        .expect("create invoice must succeed");
+
+    // Retrieve invoice
+    let record = inv_store
+        .get_invoice(&payment_hash)
+        .await
+        .expect("get invoice query")
+        .expect("invoice record must exist");
+
+    assert_eq!(record.payment_hash, payment_hash);
+    assert_eq!(record.bolt11, bolt11);
+    assert_eq!(record.amount_sats, amount);
+    assert_eq!(record.purpose, InvoicePurpose::PayPerRequest);
+    assert_eq!(record.session_id, None);
+    assert_eq!(record.status, InvoiceStatus::Pending);
+    assert_eq!(record.settled_at, None);
+
+    // 3. Test settlement update
+    let settled_time = chrono::Utc::now().timestamp();
+    let res = inv_store
+        .mark_settled(&payment_hash, settled_time)
+        .await
+        .expect("mark settled");
+    assert_eq!(
+        res,
+        satsgrid::node::storage::InvoiceSettlementResult::Settled
+    );
+
+    let settled_record = inv_store.get_invoice(&payment_hash).await.unwrap().unwrap();
+    assert_eq!(settled_record.status, InvoiceStatus::Settled);
+    assert_eq!(settled_record.settled_at, Some(settled_time));
+
+    // Test idempotent re-settlement
+    let res_again = inv_store
+        .mark_settled(&payment_hash, settled_time + 10)
+        .await
+        .expect("idempotent mark settled");
+    assert_eq!(
+        res_again,
+        satsgrid::node::storage::InvoiceSettlementResult::AlreadySettled
+    );
+
+    // Test settlement conflict on expired invoice
+    let exp_hash =
+        PaymentHash("exp-test-hash-1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
+    inv_store
+        .create_invoice(
+            &exp_hash,
+            "bolt11_exp",
+            Satoshis(50),
+            InvoicePurpose::PayPerRequest,
+            None,
+            chrono::Utc::now().timestamp() - 10,
+        )
+        .await
+        .unwrap();
+    let marked_exp = inv_store.mark_expired(&exp_hash).await.unwrap();
+    assert!(marked_exp, "Invoice should be marked expired");
+
+    let conflict_res = inv_store
+        .mark_settled(&exp_hash, chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    assert_eq!(
+        conflict_res,
+        satsgrid::node::storage::InvoiceSettlementResult::ConflictExpired
+    );
+
+    // Stored status must remain expired, not overwritten
+    let exp_record = inv_store.get_invoice(&exp_hash).await.unwrap().unwrap();
+    assert_eq!(exp_record.status, InvoiceStatus::Expired);
+    assert_eq!(exp_record.settled_at, None);
+
+    // Test settlement on non-existent invoice
+    let missing_hash =
+        PaymentHash("missing-hash-000000000000000000000000000000000000000000000000".to_string());
+    let missing_res = inv_store
+        .mark_settled(&missing_hash, chrono::Utc::now().timestamp())
+        .await
+        .unwrap();
+    assert_eq!(
+        missing_res,
+        satsgrid::node::storage::InvoiceSettlementResult::NotFound
+    );
+
+    // 4. Test duplicate payment_hash rejection (UNIQUE constraint)
+    let dup_res = inv_store
+        .create_invoice(
+            &payment_hash,
+            "another_bolt11",
+            Satoshis(200),
+            InvoicePurpose::PayPerRequest,
+            None,
+            expires_at,
+        )
+        .await;
+    assert!(dup_res.is_err(), "Duplicate payment hash must be rejected");
+
+    // 5. Test session_id foreign key association
+    let sess_store = db.session_store();
+    let session_id = SessionId(Uuid::new_v4());
+    let sess_hash =
+        PaymentHash("9999888877776666555544443333222211110000aaaabbbbccccddddeeeeffff".to_string());
+    sess_store
+        .create_pending_session(&session_id, Some(&sess_hash), Satoshis(500), expires_at)
+        .await
+        .expect("create pending session");
+
+    inv_store
+        .create_invoice(
+            &sess_hash,
+            "bolt11_for_session",
+            Satoshis(500),
+            InvoicePurpose::SessionFunding,
+            Some(&session_id),
+            expires_at,
+        )
+        .await
+        .expect("create session invoice");
+
+    let sess_inv = inv_store.get_invoice(&sess_hash).await.unwrap().unwrap();
+    assert_eq!(sess_inv.session_id, Some(session_id));
+    assert_eq!(sess_inv.purpose, InvoicePurpose::SessionFunding);
+
+    // 6. Test payment_authorizations schema extension (request_fingerprint, release_reason, released_at)
+    let pa_insert = sqlx::query(
+        "INSERT INTO payment_authorizations (
+            payment_hash, auth_type, state, idempotency_key, request_id, created_at, reserved_at, settled_at, expires_at,
+            request_fingerprint, release_reason, released_at
+        ) VALUES ('pa-test-hash', 'pay_per_request', 'released', NULL, 'req-1', 1000, 1000, NULL, 5000, 'fp-sha256-test', 'connect_failure', 1010)"
+    ).execute(pool).await;
+    assert!(
+        pa_insert.is_ok(),
+        "payment_authorizations table must accept extended Migration 7 columns"
+    );
+}

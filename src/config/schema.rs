@@ -136,6 +136,14 @@ pub enum BitcoinNetwork {
     Signet,
 }
 
+fn default_pay_per_request_expiry_secs() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_session_funding_expiry_secs() -> u64 {
+    86400 * 30 // 30 days
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LightningConfig {
     pub backend: LightningBackendType,
@@ -146,6 +154,10 @@ pub struct LightningConfig {
     pub lnd_macaroon_path: Option<String>,
     pub lnd_tls_cert_path: Option<String>,
     pub nwc_uri: Option<String>,
+    #[serde(default = "default_pay_per_request_expiry_secs")]
+    pub pay_per_request_expiry_secs: u64,
+    #[serde(default = "default_session_funding_expiry_secs")]
+    pub session_funding_expiry_secs: u64,
 }
 
 impl Default for LightningConfig {
@@ -157,6 +169,8 @@ impl Default for LightningConfig {
             lnd_macaroon_path: None,
             lnd_tls_cert_path: None,
             nwc_uri: None,
+            pay_per_request_expiry_secs: default_pay_per_request_expiry_secs(),
+            session_funding_expiry_secs: default_session_funding_expiry_secs(),
         }
     }
 }
@@ -300,6 +314,22 @@ impl NodeConfig {
         if self.concurrency.max_concurrent_per_session > self.concurrency.max_concurrent_requests {
             return Err(crate::common::error::Error::Config(
                 "concurrency.max_concurrent_per_session cannot exceed max_concurrent_requests"
+                    .to_string(),
+            ));
+        }
+        if self.lightning.pay_per_request_expiry_secs < 60
+            || self.lightning.pay_per_request_expiry_secs > 86400 * 7
+        {
+            return Err(crate::common::error::Error::Config(
+                "lightning.pay_per_request_expiry_secs must be between 60 and 604800 (7 days)"
+                    .to_string(),
+            ));
+        }
+        if self.lightning.session_funding_expiry_secs < 3600
+            || self.lightning.session_funding_expiry_secs > 86400 * 90
+        {
+            return Err(crate::common::error::Error::Config(
+                "lightning.session_funding_expiry_secs must be between 3600 and 7776000 (90 days)"
                     .to_string(),
             ));
         }

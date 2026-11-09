@@ -199,6 +199,40 @@ pub const MIGRATIONS: &[Migration] = &[
         "#,
         requires_foreign_keys_disabled: true,
     },
+    Migration {
+        version: 7,
+        name: "payguard_invoices_and_two_phase_auth",
+        sql: r#"
+        -- 1. Create durable invoices table for PayGuard
+        CREATE TABLE IF NOT EXISTS invoices (
+            payment_hash TEXT PRIMARY KEY,
+            bolt11 TEXT NOT NULL,
+            amount_sats INTEGER NOT NULL CHECK (amount_sats >= 0),
+            purpose TEXT NOT NULL CHECK (purpose IN ('pay_per_request', 'session_funding')),
+            session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending', 'settled', 'expired', 'cancelled')),
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            settled_at INTEGER,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status);
+        CREATE INDEX IF NOT EXISTS idx_invoices_purpose ON invoices(purpose);
+        CREATE INDEX IF NOT EXISTS idx_invoices_session_id ON invoices(session_id) WHERE session_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_invoices_expires_at ON invoices(expires_at);
+
+        -- 2. Add request fingerprint and release columns to payment_authorizations
+        ALTER TABLE payment_authorizations ADD COLUMN request_fingerprint TEXT;
+        ALTER TABLE payment_authorizations ADD COLUMN release_reason TEXT;
+        ALTER TABLE payment_authorizations ADD COLUMN released_at INTEGER;
+
+        CREATE INDEX IF NOT EXISTS idx_payment_authorizations_fingerprint
+            ON payment_authorizations(request_fingerprint)
+            WHERE request_fingerprint IS NOT NULL;
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
 ];
 
 /// Execute pending migrations against the SQLite pool in an atomic transaction.
