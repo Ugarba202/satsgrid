@@ -771,9 +771,14 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
     let session_store = db.session_store();
     let budget_manager = Arc::new(SessionBudgetManager::with_store(session_store.clone()));
 
+    let preimage_bytes = [0x5au8; 32];
+    let preimage_hex = hex::encode(preimage_bytes);
+    let known_payment_hash =
+        satsgrid::node::gate::verify::L402Verifier::hash_preimage(&preimage_hex).unwrap();
+
     let sid = SessionId(Uuid::new_v4());
     session_store
-        .create_session(&sid, None, Satoshis(500), 2000000000)
+        .create_session(&sid, Some(&known_payment_hash), Satoshis(500), 2000000000)
         .await
         .unwrap();
 
@@ -781,11 +786,6 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
         b"test-secret-key-0000000000000000".to_vec(),
         "satsgrid-node",
     ));
-
-    let preimage_bytes = [0x5au8; 32];
-    let preimage_hex = hex::encode(preimage_bytes);
-    let known_payment_hash =
-        satsgrid::node::gate::verify::L402Verifier::hash_preimage(&preimage_hex).unwrap();
 
     let mock_lightning = Arc::new(MockLightningBackend::new());
     mock_lightning.simulate_payment(&known_payment_hash).await;
@@ -803,7 +803,7 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
         .unwrap();
 
     let state = AppState {
-        config: Arc::new(config),
+        config: Arc::new(config.clone()),
         live_pricing: Arc::new(tokio::sync::RwLock::new(PricingConfig::new(Satoshis(10)))),
         lightning: mock_lightning,
         budget_manager,
@@ -812,6 +812,11 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-token".to_string()),
         db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);
@@ -867,4 +872,141 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
         "Dropped stream must be recorded as stream_interrupted or reconciliation_required, got {}",
         status
     );
+}
+
+#[tokio::test]
+async fn test_precise_idempotency_constraint_vs_primary_key_collision() {
+    use satsgrid::common::error::Error;
+
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.request_store();
+    let sess_store = db.session_store();
+
+    let sid = SessionId(Uuid::new_v4());
+    sess_store
+        .create_session(&sid, None, Satoshis(1000), 2000000000)
+        .await
+        .unwrap();
+
+    let req_id_1 = "fixed_req_id_primary_key_test";
+    let req_id_2 = "different_req_id";
+    let idem_key = "idempotency_key_test_123";
+
+    // 1. Initial valid insertion with idempotency key succeeds
+    store
+        .create_request(
+            req_id_1,
+            None,
+            Some(&sid),
+            None,
+            Some(idem_key),
+            "llama3.2",
+            RequestMode::NonStreaming,
+            Satoshis(10),
+        )
+        .await
+        .expect("initial insert succeeds");
+
+    // 2. A second insert with the SAME session and SAME idempotency key (different req_id)
+    // MUST fail with Error::VerificationFailed (SQLite code 2067: SQLITE_CONSTRAINT_UNIQUE)
+    let err_idem = store
+        .create_request(
+            req_id_2,
+            None,
+            Some(&sid),
+            None,
+            Some(idem_key),
+            "llama3.2",
+            RequestMode::NonStreaming,
+            Satoshis(10),
+        )
+        .await
+        .expect_err("duplicate idempotency key must fail");
+
+    match err_idem {
+        Error::VerificationFailed(msg) => {
+            assert!(msg.contains("A request with this idempotency key is currently in flight"));
+        }
+        other => panic!(
+            "Expected VerificationFailed for idempotency violation, got {:?}",
+            other
+        ),
+    }
+
+    // 3. A third insert with the SAME req_id_1 (primary key collision) but a DIFFERENT idempotency key
+    // MUST fail with Error::Internal (SQLite code 1555: SQLITE_CONSTRAINT_PRIMARYKEY), NOT VerificationFailed!
+    let err_pk = store
+        .create_request(
+            req_id_1,
+            None,
+            Some(&sid),
+            None,
+            Some("different_idem_key_456"),
+            "llama3.2",
+            RequestMode::NonStreaming,
+            Satoshis(10),
+        )
+        .await
+        .expect_err("primary key collision must fail");
+
+    match err_pk {
+        Error::Internal(msg) => {
+            assert!(
+                msg.contains("Failed to create inference request"),
+                "Got: {}",
+                msg
+            );
+            assert!(
+                msg.contains("1555") || msg.contains("PRIMARY KEY"),
+                "Got: {}",
+                msg
+            );
+        }
+        other => panic!(
+            "Expected Error::Internal for primary key collision, got {:?}",
+            other
+        ),
+    }
+
+    // 4. An insert WITHOUT idempotency key that collides on primary key
+    // MUST also fail with Error::Internal, NOT VerificationFailed!
+    let err_no_idem_pk = store
+        .create_request(
+            req_id_1,
+            None,
+            Some(&sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::NonStreaming,
+            Satoshis(10),
+        )
+        .await
+        .expect_err("PK collision without idempotency key must fail");
+
+    match err_no_idem_pk {
+        Error::Internal(msg) => {
+            assert!(msg.contains("Failed to create inference request"));
+        }
+        other => panic!(
+            "Expected Error::Internal when idempotency_key is None, got {:?}",
+            other
+        ),
+    }
+
+    // 5. Normal insert without idempotency key with unique req_id succeeds
+    store
+        .create_request(
+            "unique_req_id_no_idem",
+            None,
+            Some(&sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::NonStreaming,
+            Satoshis(10),
+        )
+        .await
+        .expect("normal insert without idempotency key succeeds");
 }

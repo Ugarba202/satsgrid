@@ -60,6 +60,7 @@ impl SessionBudget {
 #[derive(Clone, Default)]
 pub struct SessionBudgetManager {
     sessions: Arc<RwLock<HashMap<String, SessionBudget>>>,
+    pending_sessions: Arc<RwLock<HashMap<String, Satoshis>>>,
     store: Option<crate::node::storage::session::SessionStore>,
 }
 
@@ -67,6 +68,7 @@ impl SessionBudgetManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            pending_sessions: Arc::new(RwLock::new(HashMap::new())),
             store: None,
         }
     }
@@ -75,6 +77,7 @@ impl SessionBudgetManager {
     pub fn with_store(store: crate::node::storage::session::SessionStore) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            pending_sessions: Arc::new(RwLock::new(HashMap::new())),
             store: Some(store),
         }
     }
@@ -109,6 +112,131 @@ impl SessionBudgetManager {
         let mut lock = self.sessions.write().await;
         lock.insert(session_id.0.to_string(), SessionBudget::new(total_budget));
         Ok(())
+    }
+
+    /// Register a pending-payment session challenge.
+    ///
+    /// Persists a session with `status = 'pending_payment'` in SQLite when backed by storage,
+    /// without crediting any in-memory spend cache or inserting accounting ledger entries.
+    pub async fn create_pending_session(
+        &self,
+        session_id: &SessionId,
+        payment_hash: Option<&crate::common::types::PaymentHash>,
+        total_budget: Satoshis,
+        expires_at: i64,
+    ) -> Result<()> {
+        if let Some(store) = &self.store {
+            store
+                .create_pending_session(session_id, payment_hash, total_budget, expires_at)
+                .await?;
+        } else {
+            // Track pending session budget for ephemeral in-memory mode
+            let mut lock = self.pending_sessions.write().await;
+            lock.insert(session_id.0.to_string(), total_budget);
+        }
+        // Do NOT populate in-memory spend cache (sessions) while pending!
+        Ok(())
+    }
+
+    /// Lazily activate a pending session upon verified payment settlement.
+    ///
+    /// Validates that the supplied `payment_hash` matches the session's recorded payment hash in SQLite.
+    /// Delegates durable activation to SQLite. If the session was pending, it transitions to active
+    /// and inserts the single session_funding ledger entry. Synchronizes in-memory budget cache only
+    /// after database commit.
+    pub async fn activate_session_if_pending(
+        &self,
+        session_id: &SessionId,
+        payment_hash: &crate::common::types::PaymentHash,
+    ) -> Result<Satoshis> {
+        if let Some(store) = &self.store {
+            let act_result = store.activate_session(session_id, payment_hash).await?;
+            match act_result {
+                crate::node::storage::SessionActivationResult::Activated { total_budget } => {
+                    let mut lock = self.sessions.write().await;
+                    lock.insert(session_id.0.to_string(), SessionBudget::new(total_budget));
+                    Ok(total_budget)
+                }
+                crate::node::storage::SessionActivationResult::PaymentHashMismatch => {
+                    Err(Error::VerificationFailed(format!(
+                        "Payment hash mismatch for session '{}'",
+                        session_id.0
+                    )))
+                }
+                crate::node::storage::SessionActivationResult::AlreadyActive {
+                    status,
+                    remaining,
+                } => {
+                    match status {
+                        crate::node::storage::SessionStatus::Active => {
+                            // Ensure in-memory cache has the active session
+                            let mut lock = self.sessions.write().await;
+                            lock.entry(session_id.0.to_string())
+                                .or_insert_with(|| SessionBudget {
+                                    total_sats: remaining,
+                                    remaining_sats: Arc::new(AtomicU64::new(remaining.0)),
+                                });
+                            Ok(remaining)
+                        }
+                        crate::node::storage::SessionStatus::Exhausted => {
+                            Err(Error::BudgetExhausted(format!(
+                                "Session '{}' is exhausted",
+                                session_id.0
+                            )))
+                        }
+                        crate::node::storage::SessionStatus::Expired => {
+                            Err(Error::VerificationFailed(format!(
+                                "Session '{}' has expired",
+                                session_id.0
+                            )))
+                        }
+                        crate::node::storage::SessionStatus::Closed => {
+                            Err(Error::VerificationFailed(format!(
+                                "Session '{}' is closed",
+                                session_id.0
+                            )))
+                        }
+                        crate::node::storage::SessionStatus::PendingPayment => {
+                            Err(Error::VerificationFailed(format!(
+                                "Session '{}' is still pending payment",
+                                session_id.0
+                            )))
+                        }
+                    }
+                }
+                crate::node::storage::SessionActivationResult::NotFound => Err(
+                    Error::VerificationFailed(format!("Session '{}' not found", session_id.0)),
+                ),
+                crate::node::storage::SessionActivationResult::Expired { .. } => {
+                    Err(Error::VerificationFailed(format!(
+                        "Session '{}' has expired before activation",
+                        session_id.0
+                    )))
+                }
+            }
+        } else {
+            // In-memory fallback (e.g. unit tests without DB)
+            // Check if already active
+            {
+                let lock = self.sessions.read().await;
+                if let Some(b) = lock.get(&session_id.0.to_string()) {
+                    return Ok(b.remaining());
+                }
+            }
+
+            // Check if pending, and if so activate
+            let mut pending_lock = self.pending_sessions.write().await;
+            if let Some(total_budget) = pending_lock.remove(&session_id.0.to_string()) {
+                let mut sessions_lock = self.sessions.write().await;
+                sessions_lock.insert(session_id.0.to_string(), SessionBudget::new(total_budget));
+                Ok(total_budget)
+            } else {
+                Err(Error::VerificationFailed(format!(
+                    "Session '{}' not found",
+                    session_id.0
+                )))
+            }
+        }
     }
 
     /// Look up an active session budget by session ID.

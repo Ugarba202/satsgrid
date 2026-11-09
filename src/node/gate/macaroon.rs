@@ -193,7 +193,7 @@ impl MacaroonService {
             if let Some(caveat) = Caveat::parse(raw_caveat) {
                 match caveat {
                     Caveat::ExpiresAt(expires_at) => {
-                        if now_timestamp > expires_at {
+                        if now_timestamp >= expires_at {
                             return Err(Error::VerificationFailed(format!(
                                 "Macaroon has expired (expiry: {}, current: {})",
                                 expires_at, now_timestamp

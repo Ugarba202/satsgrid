@@ -163,7 +163,7 @@ impl RequestStore {
             )
         "#;
 
-        sqlx::query(query)
+        let insert_res = sqlx::query(query)
             .bind(id)
             .bind(payment_hash.map(|h| h.0.as_str()))
             .bind(session_id.map(|s| s.0.to_string()))
@@ -174,10 +174,22 @@ impl RequestStore {
             .bind(now)
             .bind(charged_sats.0 as i64)
             .execute(&self.pool)
-            .await
-            .map_err(|e| Error::Internal(format!("Failed to create inference request: {}", e)))?;
+            .await;
 
-        Ok(())
+        match insert_res {
+            Ok(_) => Ok(()),
+            Err(sqlx::Error::Database(db_err))
+                if idempotency_key.is_some() && db_err.code().as_deref() == Some("2067") =>
+            {
+                Err(Error::VerificationFailed(
+                    "A request with this idempotency key is currently in flight".to_string(),
+                ))
+            }
+            Err(e) => Err(Error::Internal(format!(
+                "Failed to create inference request: {}",
+                e
+            ))),
+        }
     }
 
     /// Fetch an inference request by payment hash.

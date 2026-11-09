@@ -65,11 +65,11 @@ pub async fn new_session(
     let uuid = uuid::Uuid::new_v4();
     let session_id = SessionId(uuid);
 
-    // Register session in the budget manager (backed by SQLite when db is active)
+    // Register pending session in the budget manager (persists as pending_payment in SQLite when db is active)
     let default_expiry = chrono::Utc::now().timestamp() + 86400 * 30; // 30 days
     state
         .budget_manager
-        .open_session_with_details(
+        .create_pending_session(
             &session_id,
             Some(&invoice.payment_hash),
             budget,
@@ -239,6 +239,15 @@ pub async fn chat_completions(
     let mut session_reservation_id: Option<String> = None;
 
     if let Some(session_id) = &session_opt {
+        // Step 2 & 2A: Lazy Session Activation with explicit payment-hash binding
+        // If this is a pending-payment session whose invoice was verified as settled,
+        // activate the session and record the initial funding ledger entry atomically,
+        // strictly verifying that session.payment_hash == credentials.macaroon.payment_hash().
+        state
+            .budget_manager
+            .activate_session_if_pending(session_id, &payment_hash)
+            .await?;
+
         // Check session idempotency key if provided
         if let (Some(db), Some(idem_key)) = (&state.db, idempotency_key) {
             let req_store = db.request_store();
@@ -259,7 +268,17 @@ pub async fn chat_completions(
                 }
             }
         }
+    }
 
+    // Stage 7.3 & 7.4: Concurrency Admission Gate
+    // Placed strictly after authentication and pre-reservation idempotency inspection,
+    // but strictly BEFORE any session budget reservation or payment authorization consumption.
+    let concurrency_permit = state
+        .concurrency_manager
+        .acquire(session_opt.as_ref())
+        .await?;
+
+    if let Some(session_id) = &session_opt {
         // Two-phase session reservation: reserve budget first
         let res_id = uuid::Uuid::new_v4().to_string();
         let remaining = state
@@ -277,7 +296,7 @@ pub async fn chat_completions(
 
         if let Some(db) = &state.db {
             let req_store = db.request_store();
-            req_store
+            if let Err(e) = req_store
                 .create_request(
                     &internal_request_id,
                     None,
@@ -288,7 +307,21 @@ pub async fn chat_completions(
                     req_mode,
                     cost,
                 )
-                .await?;
+                .await
+            {
+                if let Err(rel_err) = state
+                    .budget_manager
+                    .release_reservation(&res_id, "request_creation_failed")
+                    .await
+                {
+                    tracing::error!(
+                        reservation_id = %res_id,
+                        error = %rel_err,
+                        "Failed to release session reservation after request creation error"
+                    );
+                }
+                return Err(e);
+            }
         }
     } else {
         // Pay-per-request mode: enforce single-use authorization in persistent storage
@@ -468,6 +501,7 @@ pub async fn chat_completions(
             idle_sleep: Pin<Box<tokio::time::Sleep>>,
             idle_timeout: std::time::Duration,
             error_emitted: bool,
+            _permit: crate::node::concurrency::ConcurrencyPermit,
         }
 
         impl<S> Drop for MonitoredStream<S> {
@@ -596,6 +630,7 @@ pub async fn chat_completions(
             idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
             idle_timeout,
             error_emitted: false,
+            _permit: concurrency_permit,
         };
 
         // MonitoredStream has assumed ownership; defuse dispatch guard
@@ -618,6 +653,9 @@ pub async fn chat_completions(
 
         Ok(resp)
     } else {
+        // Retain concurrency permit in scope for non-streaming execution
+        let _permit = concurrency_permit;
+
         // Non-streaming execution with total request deadline
         upstream_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
         let proxy_res = tokio::time::timeout(
@@ -789,6 +827,30 @@ impl IntoResponse for Error {
                     Some("upstream_timeout"),
                 );
                 return err_resp.to_response(StatusCode::GATEWAY_TIMEOUT);
+            }
+            Error::ServerOverloaded(_) => {
+                let err_resp = crate::node::api::validation::OpenAiErrorResponse::new(
+                    self.to_string(),
+                    "server_overload_error",
+                    None::<String>,
+                    Some("node_capacity_exceeded"),
+                );
+                let mut resp = err_resp.to_response(StatusCode::SERVICE_UNAVAILABLE);
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+                return resp;
+            }
+            Error::ConcurrencyLimitExceeded(_) => {
+                let err_resp = crate::node::api::validation::OpenAiErrorResponse::new(
+                    self.to_string(),
+                    "concurrency_limit_error",
+                    None::<String>,
+                    Some("session_concurrency_exceeded"),
+                );
+                let mut resp = err_resp.to_response(StatusCode::TOO_MANY_REQUESTS);
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+                return resp;
             }
             Error::Lightning(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
             Error::Validation(val_err) => {
