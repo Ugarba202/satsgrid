@@ -72,18 +72,26 @@ impl OpenAiProxy {
         let url = format!("{}/v1/chat/completions", self.upstream_url);
 
         let mut req_headers = reqwest::header::HeaderMap::new();
+
+        // Minimal allowlist of safe client headers for upstream inference.
+        // Explicitly excludes Authorization, Host, Content-Length, Transfer-Encoding,
+        // Connection, and all other hop-by-hop/transport metadata so Reqwest constructs
+        // clean transport headers matching the serialized JSON body.
         for (k, v) in headers.iter() {
             let key_str = k.as_str().to_lowercase();
-            // Drop authorization, but allow other safe headers
-            if key_str != "authorization" {
-                req_headers.insert(k.clone(), v.clone());
+            match key_str.as_str() {
+                "accept" | "accept-language" | "user-agent" => {
+                    req_headers.insert(k.clone(), v.clone());
+                }
+                _ => {}
             }
         }
 
-        // Ensure Content-Type is set
-        if !req_headers.contains_key("content-type") {
-            req_headers.insert("content-type", "application/json".parse().unwrap());
-        }
+        // Ensure Content-Type is application/json
+        req_headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
 
         let send_future = self
             .client
