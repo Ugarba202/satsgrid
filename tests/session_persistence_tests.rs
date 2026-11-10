@@ -872,3 +872,216 @@ async fn test_existing_session_api_regression() {
     assert_eq!(record.remaining_sats, Satoshis(0));
     assert_eq!(record.status, SessionStatus::PendingPayment);
 }
+
+#[tokio::test]
+async fn test_close_active_session_with_remaining_budget() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.session_store();
+
+    let session_id = SessionId(Uuid::new_v4());
+    let payment_hash =
+        PaymentHash("1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".to_string());
+    let budget = Satoshis(1000);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    store
+        .create_session(&session_id, Some(&payment_hash), budget, expires_at)
+        .await
+        .expect("create session");
+
+    // Close session voluntarily
+    let close_res = store
+        .close_session(&session_id, Some("user_closed"))
+        .await
+        .expect("close session");
+    assert!(
+        matches!(
+            close_res,
+            satsgrid::node::storage::SessionCloseResult::Closed { .. }
+        ),
+        "Expected Closed, got {:?}",
+        close_res
+    );
+
+    // Verify session state
+    let record = store
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    assert_eq!(record.status, SessionStatus::Closed);
+    assert_eq!(record.remaining_sats, Satoshis(0));
+    assert_eq!(record.reserved_sats, Satoshis(0));
+    assert_eq!(record.spent_sats, Satoshis(1000));
+    assert_eq!(record.total_budget_sats, Satoshis(1000));
+    assert!(record.closed_at.is_some());
+    assert_eq!(record.closed_reason.as_deref(), Some("user_closed"));
+
+    // Verify accounting invariant chk_session_budget_sum holds: remaining + reserved + spent = total
+    assert_eq!(
+        record.remaining_sats.0 + record.reserved_sats.0 + record.spent_sats.0,
+        record.total_budget_sats.0
+    );
+
+    // Verify accounting ledger entry was written
+    let entries = store
+        .get_accounting_entries(&session_id)
+        .await
+        .expect("fetch entries");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].1, "session_funding");
+    assert_eq!(entries[0].2, 1000);
+    assert_eq!(entries[1].1, "session_debit");
+    assert_eq!(entries[1].2, 1000);
+}
+
+#[tokio::test]
+async fn test_close_pending_session() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.session_store();
+
+    let session_id = SessionId(Uuid::new_v4());
+    let payment_hash =
+        PaymentHash("abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string());
+    let budget = Satoshis(400);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    store
+        .create_pending_session(&session_id, Some(&payment_hash), budget, expires_at)
+        .await
+        .expect("create pending session");
+
+    let close_res = store
+        .close_session(&session_id, Some("client_cancelled"))
+        .await
+        .expect("close pending session");
+    assert!(
+        matches!(
+            close_res,
+            satsgrid::node::storage::SessionCloseResult::Closed { .. }
+        ),
+        "Expected Closed, got {:?}",
+        close_res
+    );
+
+    let record = store
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .expect("session exists");
+    assert_eq!(record.status, SessionStatus::Closed);
+    assert_eq!(record.remaining_sats, Satoshis(0));
+    assert_eq!(record.reserved_sats, Satoshis(0));
+    assert_eq!(record.spent_sats, Satoshis(0));
+    assert_eq!(record.total_budget_sats, Satoshis(0));
+    assert!(record.closed_at.is_some());
+    assert_eq!(record.closed_reason.as_deref(), Some("client_cancelled"));
+}
+
+#[tokio::test]
+async fn test_close_session_idempotency() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.session_store();
+
+    let session_id = SessionId(Uuid::new_v4());
+    let budget = Satoshis(300);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    store
+        .create_session(&session_id, None, budget, expires_at)
+        .await
+        .expect("create session");
+
+    // First close
+    let res1 = store
+        .close_session(&session_id, Some("first_close"))
+        .await
+        .expect("first close");
+    assert!(matches!(
+        res1,
+        satsgrid::node::storage::SessionCloseResult::Closed { .. }
+    ));
+
+    // Second close should be idempotent
+    let res2 = store
+        .close_session(&session_id, Some("second_close"))
+        .await
+        .expect("second close");
+    assert!(matches!(
+        res2,
+        satsgrid::node::storage::SessionCloseResult::AlreadyClosed { .. }
+    ));
+
+    // Verify original close reason and timestamp preserved
+    let record = store.get_session(&session_id).await.unwrap().unwrap();
+    assert_eq!(record.closed_reason.as_deref(), Some("first_close"));
+}
+
+#[tokio::test]
+async fn test_close_session_rejected_when_requests_active() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.session_store();
+
+    let session_id = SessionId(Uuid::new_v4());
+    let budget = Satoshis(500);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    store
+        .create_session(&session_id, None, budget, expires_at)
+        .await
+        .expect("create session");
+
+    // Reserve 100 sats for an active in-flight request
+    let res = store
+        .reserve_budget(&session_id, Satoshis(100), "req-active-1")
+        .await
+        .expect("reserve");
+    assert!(matches!(res, SessionReservationResult::Reserved { .. }));
+
+    // Attempting to close while reserved > 0 must return ActiveRequestsPending
+    let close_res = store
+        .close_session(&session_id, Some("close_during_flight"))
+        .await
+        .expect("close attempt");
+    assert!(
+        matches!(
+            close_res,
+            satsgrid::node::storage::SessionCloseResult::ActiveRequestsPending { .. }
+        ),
+        "Must reject closure while requests are active, got {:?}",
+        close_res
+    );
+
+    // Session remains active
+    let record = store.get_session(&session_id).await.unwrap().unwrap();
+    assert_eq!(record.status, SessionStatus::Active);
+    assert_eq!(record.reserved_sats, Satoshis(100));
+    assert_eq!(record.remaining_sats, Satoshis(400));
+    assert!(record.closed_at.is_none());
+
+    // Finalize request
+    store
+        .finalize_reservation("req-active-1")
+        .await
+        .expect("finalize");
+
+    // Now that reserved_sats is 0, closure must succeed
+    let close_res2 = store
+        .close_session(&session_id, Some("close_after_flight"))
+        .await
+        .expect("close after finalize");
+    assert!(matches!(
+        close_res2,
+        satsgrid::node::storage::SessionCloseResult::Closed { .. }
+    ));
+
+    let record_closed = store.get_session(&session_id).await.unwrap().unwrap();
+    assert_eq!(record_closed.status, SessionStatus::Closed);
+    assert_eq!(record_closed.remaining_sats, Satoshis(0));
+    assert_eq!(record_closed.reserved_sats, Satoshis(0));
+    assert_eq!(record_closed.spent_sats, Satoshis(500));
+}

@@ -636,3 +636,69 @@ async fn test_numeric_parameters_boundary_validation() {
         StatusCode::BAD_REQUEST
     );
 }
+
+#[tokio::test]
+async fn test_canonical_request_fingerprint_semantics() {
+    let rules = satsgrid::node::api::validation::ChatValidationRules::default();
+
+    // 1. Identical payloads produce identical fingerprints
+    let p1 = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hello world"}],
+        "temperature": 0.7
+    });
+    let p2 = json!({
+        "temperature": 0.7,
+        "messages": [{"role": "user", "content": "Hello world"}],
+        "model": "gpt-4o"
+    });
+
+    let v1 = satsgrid::node::api::validation::ValidatedChatRequest::validate(p1, &rules).unwrap();
+    let v2 = satsgrid::node::api::validation::ValidatedChatRequest::validate(p2, &rules).unwrap();
+
+    let fp1 = v1.compute_canonical_fingerprint();
+    let fp2 = v2.compute_canonical_fingerprint();
+    assert_eq!(
+        fp1, fp2,
+        "Field reordering must produce identical fingerprints"
+    );
+
+    // 2. Changed message content produces different fingerprint
+    let p3 = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hello world!"}],
+        "temperature": 0.7
+    });
+    let v3 = satsgrid::node::api::validation::ValidatedChatRequest::validate(p3, &rules).unwrap();
+    assert_ne!(
+        fp1,
+        v3.compute_canonical_fingerprint(),
+        "Changed content must alter fingerprint"
+    );
+
+    // 3. Changed model produces different fingerprint
+    let p4 = json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Hello world"}],
+        "temperature": 0.7
+    });
+    let v4 = satsgrid::node::api::validation::ValidatedChatRequest::validate(p4, &rules).unwrap();
+    assert_ne!(
+        fp1,
+        v4.compute_canonical_fingerprint(),
+        "Changed model must alter fingerprint"
+    );
+
+    // 4. Exact numerical precision preserved (0.7 != 0.7001)
+    let p5 = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Hello world"}],
+        "temperature": 0.7001
+    });
+    let v5 = satsgrid::node::api::validation::ValidatedChatRequest::validate(p5, &rules).unwrap();
+    assert_ne!(
+        fp1,
+        v5.compute_canonical_fingerprint(),
+        "Numerical differences must alter fingerprint"
+    );
+}

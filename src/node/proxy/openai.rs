@@ -1,3 +1,33 @@
+/// Conservative classification of upstream transport dispatch outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportDispatchOutcome {
+    /// Conclusive evidence that no request bytes were transmitted to the upstream service.
+    /// Safe for automated reservation release or pre-dispatch retry.
+    DefinitelyNotDispatched,
+    /// Upstream transmission was initiated or outcome is ambiguous.
+    /// Conservative handling required to protect budget and prevent double-spend.
+    DispatchOutcomeUnknown,
+}
+
+impl TransportDispatchOutcome {
+    /// Classifies a Reqwest error according to conservative transport boundaries.
+    ///
+    /// Only classifies as `DefinitelyNotDispatched` when the error is an explicit connection
+    /// refusal/resolution failure where the TCP handshake was never completed.
+    pub fn classify_reqwest_error(err: &reqwest::Error) -> Self {
+        if err.is_connect() {
+            // Note: Verify it's not a timeout or partial write error masquerading as connect
+            if err.is_timeout() {
+                Self::DispatchOutcomeUnknown
+            } else {
+                Self::DefinitelyNotDispatched
+            }
+        } else {
+            Self::DispatchOutcomeUnknown
+        }
+    }
+}
+
 use crate::common::error::Result;
 use futures_util::Stream;
 use reqwest::Client;
@@ -101,7 +131,8 @@ impl OpenAiProxy {
             .send();
         let resp = match tokio::time::timeout(self.header_timeout, send_future).await {
             Ok(send_res) => send_res.map_err(|e| {
-                if e.is_connect() {
+                let outcome = TransportDispatchOutcome::classify_reqwest_error(&e);
+                if outcome == TransportDispatchOutcome::DefinitelyNotDispatched {
                     crate::common::error::Error::UpstreamConnect(format!(
                         "Upstream connection establishment failed: {}",
                         e
@@ -181,7 +212,8 @@ impl OpenAiProxy {
 
         let resp = match tokio::time::timeout(self.header_timeout, send_future).await {
             Ok(send_res) => send_res.map_err(|e| {
-                if e.is_connect() {
+                let outcome = TransportDispatchOutcome::classify_reqwest_error(&e);
+                if outcome == TransportDispatchOutcome::DefinitelyNotDispatched {
                     crate::common::error::Error::UpstreamConnect(format!(
                         "Upstream connection establishment failed: {}",
                         e

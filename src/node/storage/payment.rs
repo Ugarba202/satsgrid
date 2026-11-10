@@ -53,17 +53,18 @@ impl PaymentStore {
         Self { pool }
     }
 
-    /// Attempt to reserve a pay-per-request payment hash atomically.
+    /// Attempt to reserve a pay-per-request payment hash atomically with request fingerprint.
     ///
     /// Returns `Ok(ReservationResult::Reserved)` if this is the first submission.
     /// Returns `Ok(ReservationResult::AlreadyUsed)` if the hash was previously recorded.
     /// Returns `Err(Error)` if SQLite is unavailable or encounters a non-constraint error.
-    pub async fn reserve_payment_hash(
+    pub async fn reserve_payment_hash_with_fingerprint(
         &self,
         payment_hash: &PaymentHash,
         request_id: &str,
         expires_at: u64,
         idempotency_key: Option<&str>,
+        request_fingerprint: Option<&str>,
     ) -> Result<ReservationResult> {
         let now = chrono::Utc::now().timestamp();
 
@@ -77,8 +78,9 @@ impl PaymentStore {
                 created_at,
                 reserved_at,
                 settled_at,
-                expires_at
-            ) VALUES (?1, 'pay_per_request', 'reserved', ?2, ?3, ?4, ?4, NULL, ?5)
+                expires_at,
+                request_fingerprint
+            ) VALUES (?1, 'pay_per_request', 'reserved', ?2, ?3, ?4, ?4, NULL, ?5, ?6)
         "#;
 
         let insert_res = sqlx::query(query)
@@ -87,6 +89,7 @@ impl PaymentStore {
             .bind(request_id)
             .bind(now)
             .bind(expires_at as i64)
+            .bind(request_fingerprint)
             .execute(&self.pool)
             .await;
 
@@ -94,8 +97,8 @@ impl PaymentStore {
             Ok(_) => Ok(ReservationResult::Reserved),
             Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
                 // Fetch existing record to provide diagnostic detail
-                let existing: Option<(String, i64)> = sqlx::query_as(
-                    "SELECT state, reserved_at FROM payment_authorizations WHERE payment_hash = ?1",
+                let existing: Option<(String, i64, Option<String>)> = sqlx::query_as(
+                    "SELECT state, reserved_at, request_fingerprint FROM payment_authorizations WHERE payment_hash = ?1",
                 )
                 .bind(&payment_hash.0)
                 .fetch_optional(&self.pool)
@@ -104,7 +107,15 @@ impl PaymentStore {
                     Error::Internal(format!("Failed to query payment authorization: {}", e))
                 })?;
 
-                if let Some((state, reserved_at)) = existing {
+                if let Some((state, reserved_at, existing_fp)) = existing {
+                    // If a fingerprint was recorded and caller supplies a different fingerprint, reject mismatch
+                    if let (Some(req_fp), Some(stored_fp)) = (request_fingerprint, existing_fp) {
+                        if req_fp != stored_fp {
+                            return Err(Error::Unauthorized(
+                                "Payment authorization fingerprint mismatch: cannot alter request parameters on retry".to_string(),
+                            ));
+                        }
+                    }
                     Ok(ReservationResult::AlreadyUsed { state, reserved_at })
                 } else {
                     Ok(ReservationResult::AlreadyUsed {
@@ -118,6 +129,24 @@ impl PaymentStore {
                 e
             ))),
         }
+    }
+
+    /// Attempt to reserve a pay-per-request payment hash atomically.
+    pub async fn reserve_payment_hash(
+        &self,
+        payment_hash: &PaymentHash,
+        request_id: &str,
+        expires_at: u64,
+        idempotency_key: Option<&str>,
+    ) -> Result<ReservationResult> {
+        self.reserve_payment_hash_with_fingerprint(
+            payment_hash,
+            request_id,
+            expires_at,
+            idempotency_key,
+            None,
+        )
+        .await
     }
 
     /// Mark an existing reserved payment authorization as settled and consumed.

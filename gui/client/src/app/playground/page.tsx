@@ -52,7 +52,13 @@ export default function PlaygroundPage() {
         if (stored.messages && stored.messages.length > 0) {
           setMessages(stored.messages);
         }
-        setSessionStatus(stored.status === "active" ? "active" : "idle");
+        setSessionStatus(
+          stored.status === "active"
+            ? "active"
+            : stored.status === "closed"
+            ? "closed"
+            : "idle"
+        );
         return;
       }
     }

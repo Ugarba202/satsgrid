@@ -2310,3 +2310,493 @@ async fn test_step2a_streaming_lazy_activation() {
         rec_active.total_budget_sats.0
     );
 }
+
+#[tokio::test]
+async fn test_session_close_api_unauthorized_rejection() {
+    let app = setup_app();
+
+    // 1. Missing Authorization header completely
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({}).to_string()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // 2. Unsupported authorization scheme
+    let req2 = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("content-type", "application/json")
+        .header("authorization", "Basic dXNlcjpwYXNz")
+        .body(Body::from(json!({}).to_string()))
+        .unwrap();
+
+    let resp2 = app.clone().oneshot(req2).await.unwrap();
+    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_session_close_api_l402_success_and_idempotency() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::init(dir.path()).await.unwrap());
+    let lightning = Arc::new(MockLightningBackend::new());
+    let budget_manager = Arc::new(SessionBudgetManager::with_store(db.session_store()));
+    let macaroon_service = Arc::new(MacaroonService::new(
+        b"test-secret-key-0000000000000000".to_vec(),
+        "satsgrid-node",
+    ));
+
+    let config = NodeConfig {
+        pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
+        upstream: satsgrid::config::schema::UpstreamConfig {
+            url: "http://localhost:8080".to_string(),
+            ..Default::default()
+        },
+        lightning: satsgrid::config::schema::LightningConfig::default(),
+        data_dir: dir.path().to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        live_pricing: Arc::new(tokio::sync::RwLock::new(config.pricing.clone())),
+        lightning: lightning.clone(),
+        budget_manager: budget_manager.clone(),
+        macaroon_service: macaroon_service.clone(),
+        proxy: OpenAiProxy::new(config.upstream.url.clone()),
+        stats: Arc::new(satsgrid::node::api::NodeStats::default()),
+        admin_token: Arc::new("test-admin-token".to_string()),
+        db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
+    };
+
+    let app = create_routes(state);
+
+    // 1. Create a session via POST /v1/session/new
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/session/new")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "budget_sats": 500 }).to_string()))
+        .unwrap();
+
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+    let auth_header = resp
+        .headers()
+        .get("WWW-Authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let challenge = L402Challenge::from_header_value(auth_header).unwrap();
+
+    // Pay invoice to get preimage
+    let preimage = lightning.pay_invoice(&challenge.invoice).await.unwrap();
+    let l402_auth = format!("L402 {}:{}", challenge.macaroon, preimage);
+
+    // Parse session_id from macaroon
+    let macaroon = Macaroon::from_base64(&challenge.macaroon).unwrap();
+    let (extracted_id, _) = SessionBudgetManager::extract_session_caveats(&macaroon);
+    let session_id = extracted_id.unwrap();
+
+    // Activate the session in DB
+    db.session_store()
+        .activate_session(&session_id, &macaroon.payment_hash())
+        .await
+        .unwrap();
+
+    // 2. Call POST /v1/session/close with valid L402 header
+    let close_req = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("content-type", "application/json")
+        .header("authorization", &l402_auth)
+        .body(Body::from(
+            json!({ "reason": "voluntary_user_close" }).to_string(),
+        ))
+        .unwrap();
+
+    let close_resp = app.clone().oneshot(close_req).await.unwrap();
+    assert_eq!(close_resp.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(close_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body_json["status"], "closed");
+    assert_eq!(body_json["session_id"], session_id.0.to_string());
+    assert_eq!(body_json["remaining_sats"], 0);
+    assert_eq!(body_json["reserved_sats"], 0);
+    assert_eq!(body_json["spent_sats"], 500);
+    assert_eq!(body_json["total_budget_sats"], 500);
+    assert!(body_json["closed_at"].as_i64().is_some());
+    assert_eq!(body_json["reason"], "voluntary_user_close");
+
+    // 3. Repeat call should return 200 with status "already_closed" (idempotency)
+    let repeat_req = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("content-type", "application/json")
+        .header("authorization", &l402_auth)
+        .body(Body::from(
+            json!({ "reason": "second_attempt" }).to_string(),
+        ))
+        .unwrap();
+
+    let repeat_resp = app.clone().oneshot(repeat_req).await.unwrap();
+    assert_eq!(repeat_resp.status(), StatusCode::OK);
+
+    let repeat_bytes = axum::body::to_bytes(repeat_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let repeat_json: serde_json::Value = serde_json::from_slice(&repeat_bytes).unwrap();
+    assert_eq!(repeat_json["status"], "already_closed");
+    assert_eq!(repeat_json["session_id"], session_id.0.to_string());
+    assert_eq!(repeat_json["remaining_sats"], 0);
+
+    // 4. Verify post-closure inference attempt fails
+    let chat_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", &l402_auth)
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let chat_resp = app.clone().oneshot(chat_req).await.unwrap();
+    assert_eq!(chat_resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_session_close_api_admin_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::init(dir.path()).await.unwrap());
+    let lightning = Arc::new(MockLightningBackend::new());
+    let budget_manager = Arc::new(SessionBudgetManager::with_store(db.session_store()));
+    let macaroon_service = Arc::new(MacaroonService::new(
+        b"test-secret-key-0000000000000000".to_vec(),
+        "satsgrid-node",
+    ));
+
+    let config = NodeConfig {
+        pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
+        upstream: satsgrid::config::schema::UpstreamConfig {
+            url: "http://localhost:8080".to_string(),
+            ..Default::default()
+        },
+        lightning: satsgrid::config::schema::LightningConfig::default(),
+        data_dir: dir.path().to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        live_pricing: Arc::new(tokio::sync::RwLock::new(config.pricing.clone())),
+        lightning: lightning.clone(),
+        budget_manager: budget_manager.clone(),
+        macaroon_service: macaroon_service.clone(),
+        proxy: OpenAiProxy::new(config.upstream.url.clone()),
+        stats: Arc::new(satsgrid::node::api::NodeStats::default()),
+        admin_token: Arc::new("super-secret-admin".to_string()),
+        db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
+    };
+
+    let app = create_routes(state);
+
+    // Create session in SQLite
+    let session_id = satsgrid::common::types::SessionId(uuid::Uuid::new_v4());
+    db.session_store()
+        .create_session(
+            &session_id,
+            None,
+            satsgrid::common::types::Satoshis(1000),
+            chrono::Utc::now().timestamp() + 3600,
+        )
+        .await
+        .unwrap();
+
+    // 1. Close as admin without session_id in body -> 400 Bad Request
+    let req_missing_id = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer super-secret-admin")
+        .body(Body::from(json!({ "reason": "admin_audit" }).to_string()))
+        .unwrap();
+
+    let resp_missing = app.clone().oneshot(req_missing_id).await.unwrap();
+    assert_eq!(resp_missing.status(), StatusCode::BAD_REQUEST);
+
+    // 2. Close as admin with wrong token -> 401 Unauthorized
+    let req_bad_token = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer wrong-admin-token")
+        .body(Body::from(
+            json!({
+                "session_id": session_id.0.to_string(),
+                "reason": "admin_audit"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp_bad_token = app.clone().oneshot(req_bad_token).await.unwrap();
+    assert_eq!(resp_bad_token.status(), StatusCode::UNAUTHORIZED);
+
+    // 3. Close as admin with correct token and valid session_id -> 200 OK
+    let req_valid = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer super-secret-admin")
+        .body(Body::from(
+            json!({
+                "session_id": session_id.0.to_string(),
+                "reason": "admin_override"
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let resp_valid = app.clone().oneshot(req_valid).await.unwrap();
+    assert_eq!(resp_valid.status(), StatusCode::OK);
+
+    let body_bytes = axum::body::to_bytes(resp_valid.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(body_json["status"], "closed");
+    assert_eq!(body_json["session_id"], session_id.0.to_string());
+    assert_eq!(body_json["remaining_sats"], 0);
+    assert_eq!(body_json["spent_sats"], 1000);
+}
+
+#[tokio::test]
+async fn test_durable_invoice_issuance_and_settlement_integration() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::init(dir.path()).await.unwrap());
+    let lightning = Arc::new(MockLightningBackend::new());
+    let budget_manager = Arc::new(SessionBudgetManager::with_store(db.session_store()));
+    let macaroon_service = Arc::new(MacaroonService::new(
+        b"test-secret-key-0000000000000000".to_vec(),
+        "satsgrid-node",
+    ));
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-invoice-test",
+            "choices": [{"message": {"role": "assistant", "content": "Invoice recorded!"}}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let config = NodeConfig {
+        pricing: PricingConfig::new(satsgrid::common::types::Satoshis(15)),
+        upstream: satsgrid::config::schema::UpstreamConfig {
+            url: mock_server.uri(),
+            ..Default::default()
+        },
+        lightning: satsgrid::config::schema::LightningConfig::default(),
+        data_dir: dir.path().to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        live_pricing: Arc::new(tokio::sync::RwLock::new(config.pricing.clone())),
+        lightning: lightning.clone(),
+        budget_manager: budget_manager.clone(),
+        macaroon_service: macaroon_service.clone(),
+        proxy: OpenAiProxy::new(config.upstream.url.clone()),
+        stats: Arc::new(satsgrid::node::api::NodeStats::default()),
+        admin_token: Arc::new("test-admin-token".to_string()),
+        db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
+    };
+
+    let app = create_routes(state);
+
+    // 1. Test Session Funding Invoice Issuance & Settlement
+    let sess_req = Request::builder()
+        .method("POST")
+        .uri("/v1/session/new")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "budget_sats": 300 }).to_string()))
+        .unwrap();
+
+    let sess_resp = app.clone().oneshot(sess_req).await.unwrap();
+    assert_eq!(sess_resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+    let auth_header = sess_resp
+        .headers()
+        .get("WWW-Authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let challenge = L402Challenge::from_header_value(auth_header).unwrap();
+    let macaroon = Macaroon::from_base64(&challenge.macaroon).unwrap();
+    let session_hash = macaroon.payment_hash();
+
+    // Verify invoice was persisted in SQLite before 402 challenge was emitted
+    let stored_sess_inv = db
+        .invoice_store()
+        .get_invoice(&session_hash)
+        .await
+        .unwrap()
+        .expect("session invoice must be persisted");
+    assert_eq!(
+        stored_sess_inv.status,
+        satsgrid::node::storage::InvoiceStatus::Pending
+    );
+    assert_eq!(
+        stored_sess_inv.purpose,
+        satsgrid::node::storage::InvoicePurpose::SessionFunding
+    );
+    assert_eq!(
+        stored_sess_inv.amount_sats,
+        satsgrid::common::types::Satoshis(300)
+    );
+
+    // Pay invoice and execute request to trigger lazy activation & settlement
+    let preimage = lightning.pay_invoice(&challenge.invoice).await.unwrap();
+    let l402_auth = format!("L402 {}:{}", challenge.macaroon, preimage);
+
+    let chat_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", &l402_auth)
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi session"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let chat_resp = app.clone().oneshot(chat_req).await.unwrap();
+    assert_eq!(chat_resp.status(), StatusCode::OK);
+
+    // Verify invoice status transitioned to Settled in SQLite
+    let settled_sess_inv = db
+        .invoice_store()
+        .get_invoice(&session_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled_sess_inv.status,
+        satsgrid::node::storage::InvoiceStatus::Settled
+    );
+    assert!(settled_sess_inv.settled_at.is_some());
+
+    // 2. Test Pay-Per-Request Invoice Issuance & Settlement
+    let ppr_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi ppr"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let ppr_resp = app.clone().oneshot(ppr_req).await.unwrap();
+    assert_eq!(ppr_resp.status(), StatusCode::PAYMENT_REQUIRED);
+
+    let ppr_auth_header = ppr_resp
+        .headers()
+        .get("WWW-Authenticate")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let ppr_challenge = L402Challenge::from_header_value(ppr_auth_header).unwrap();
+    let ppr_macaroon = Macaroon::from_base64(&ppr_challenge.macaroon).unwrap();
+    let ppr_hash = ppr_macaroon.payment_hash();
+
+    // Verify PPR invoice was persisted in SQLite before 402 challenge was emitted
+    let stored_ppr_inv = db
+        .invoice_store()
+        .get_invoice(&ppr_hash)
+        .await
+        .unwrap()
+        .expect("PPR invoice must be persisted");
+    assert_eq!(
+        stored_ppr_inv.status,
+        satsgrid::node::storage::InvoiceStatus::Pending
+    );
+    assert_eq!(
+        stored_ppr_inv.purpose,
+        satsgrid::node::storage::InvoicePurpose::PayPerRequest
+    );
+    assert_eq!(
+        stored_ppr_inv.amount_sats,
+        satsgrid::common::types::Satoshis(15)
+    );
+
+    // Settle PPR invoice and complete inference
+    let ppr_preimage = lightning.pay_invoice(&ppr_challenge.invoice).await.unwrap();
+    let ppr_l402_auth = format!("L402 {}:{}", ppr_challenge.macaroon, ppr_preimage);
+
+    let ppr_exec_req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .header("authorization", &ppr_l402_auth)
+        .body(Body::from(
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi ppr"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let ppr_exec_resp = app.clone().oneshot(ppr_exec_req).await.unwrap();
+    assert_eq!(ppr_exec_resp.status(), StatusCode::OK);
+
+    // Verify PPR invoice transitioned to Settled in SQLite
+    let settled_ppr_inv = db
+        .invoice_store()
+        .get_invoice(&ppr_hash)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        settled_ppr_inv.status,
+        satsgrid::node::storage::InvoiceStatus::Settled
+    );
+    assert!(settled_ppr_inv.settled_at.is_some());
+}

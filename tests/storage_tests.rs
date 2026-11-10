@@ -715,3 +715,200 @@ async fn test_migration_7_invoices_schema_and_integrity() {
         "payment_authorizations table must accept extended Migration 7 columns"
     );
 }
+
+#[tokio::test]
+async fn test_migration_8_session_closure_schema_and_integrity() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path())
+        .await
+        .expect("Database initialization should succeed");
+    let pool = db.pool();
+
+    // 1. Verify schema version in _satsgrid_migrations is at least 8
+    let max_migration: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _satsgrid_migrations")
+        .fetch_one(pool)
+        .await
+        .expect("fetch max migration version");
+    assert!(
+        max_migration >= 8,
+        "Applied migration version must be at least 8, got {}",
+        max_migration
+    );
+
+    // 2. Verify closed_at and closed_reason columns in table_info(sessions)
+    let columns: Vec<(i64, String, String, i64, Option<String>, i64)> =
+        sqlx::query_as("PRAGMA table_info(sessions)")
+            .fetch_all(pool)
+            .await
+            .expect("fetch pragma table_info");
+
+    let col_names: Vec<String> = columns.into_iter().map(|c| c.1).collect();
+    assert!(
+        col_names.contains(&"closed_at".to_string()),
+        "sessions must have closed_at column"
+    );
+    assert!(
+        col_names.contains(&"closed_reason".to_string()),
+        "sessions must have closed_reason column"
+    );
+
+    // 3. Verify idx_sessions_closed_at index exists
+    let indices: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'sessions'",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("fetch index list");
+    let index_names: Vec<String> = indices.into_iter().map(|i| i.0).collect();
+    assert!(
+        index_names.contains(&"idx_sessions_closed_at".to_string()),
+        "idx_sessions_closed_at index must exist"
+    );
+}
+
+#[tokio::test]
+async fn test_create_pending_session_with_invoice_atomicity() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let session_store = db.session_store();
+    let invoice_store = db.invoice_store();
+
+    let session_id = satsgrid::common::types::SessionId(uuid::Uuid::new_v4());
+    let payment_hash = satsgrid::common::types::PaymentHash(
+        "abcdef11223344556677889900aabbccddeeff11223344556677889900aabbcc".to_string(),
+    );
+    let bolt11 = "lnbc1000u1p3test...";
+    let budget = satsgrid::common::types::Satoshis(1000);
+    let expires_at = chrono::Utc::now().timestamp() + 3600;
+
+    session_store
+        .create_pending_session_with_invoice(&session_id, &payment_hash, bolt11, budget, expires_at)
+        .await
+        .expect("atomic session and invoice creation");
+
+    // 1. Verify session was created with pending_payment status
+    let session = session_store
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .expect("session must exist");
+    assert_eq!(
+        session.status,
+        satsgrid::node::storage::SessionStatus::PendingPayment
+    );
+    assert_eq!(session.total_budget_sats, budget);
+    assert_eq!(session.remaining_sats.0, 0);
+    assert_eq!(session.payment_hash.as_ref(), Some(&payment_hash));
+
+    // 2. Verify invoice was persisted atomically with pending status and correct linkage
+    let invoice = invoice_store
+        .get_invoice(&payment_hash)
+        .await
+        .unwrap()
+        .expect("invoice must exist");
+    assert_eq!(
+        invoice.status,
+        satsgrid::node::storage::InvoiceStatus::Pending
+    );
+    assert_eq!(
+        invoice.purpose,
+        satsgrid::node::storage::InvoicePurpose::SessionFunding
+    );
+    assert_eq!(invoice.session_id.as_ref(), Some(&session_id));
+    assert_eq!(invoice.amount_sats, budget);
+    assert_eq!(invoice.bolt11, bolt11);
+    assert_eq!(invoice.expires_at, expires_at);
+
+    // 3. Mark settled and verify transition
+    let settle_res = invoice_store
+        .mark_settled(&payment_hash, chrono::Utc::now().timestamp())
+        .await
+        .expect("mark settled");
+    assert_eq!(
+        settle_res,
+        satsgrid::node::storage::InvoiceSettlementResult::Settled
+    );
+
+    let updated_invoice = invoice_store
+        .get_invoice(&payment_hash)
+        .await
+        .unwrap()
+        .expect("invoice exists");
+    assert_eq!(
+        updated_invoice.status,
+        satsgrid::node::storage::InvoiceStatus::Settled
+    );
+    assert!(updated_invoice.settled_at.is_some());
+
+    // 4. Repeated mark_settled is idempotent
+    let idempotent_res = invoice_store
+        .mark_settled(&payment_hash, chrono::Utc::now().timestamp())
+        .await
+        .expect("idempotent mark settled");
+    assert_eq!(
+        idempotent_res,
+        satsgrid::node::storage::InvoiceSettlementResult::AlreadySettled
+    );
+}
+
+#[tokio::test]
+async fn test_migration_9_reconciliation_items_schema_and_integrity() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let recon_store = db.reconciliation_store();
+
+    // 1. Initially 0 unresolved
+    let initial_count = recon_store.count_unresolved().await.expect("count");
+    assert_eq!(initial_count, 0);
+
+    // 2. Create an item
+    let item_id = recon_store
+        .create_or_update_item(
+            satsgrid::node::storage::ReconciliationItemType::InferenceRequest,
+            "req_ambiguous_123",
+            None,
+            None,
+            "unresolved_crash_during_execution",
+            Some("Node crashed while request was in processing state"),
+            None,
+        )
+        .await
+        .expect("create item");
+
+    assert!(!item_id.is_empty());
+    assert_eq!(recon_store.count_unresolved().await.expect("count"), 1);
+
+    // 3. Fetch eligible items
+    let eligible = recon_store
+        .get_eligible_retry_items(10)
+        .await
+        .expect("fetch eligible");
+    assert_eq!(eligible.len(), 1);
+    assert_eq!(eligible[0].reference_id, "req_ambiguous_123");
+    assert_eq!(
+        eligible[0].status,
+        satsgrid::node::storage::ReconciliationStatus::Unresolved
+    );
+
+    // 4. Update item with backoff
+    let updated_id = recon_store
+        .create_or_update_item(
+            satsgrid::node::storage::ReconciliationItemType::InferenceRequest,
+            "req_ambiguous_123",
+            None,
+            None,
+            "unresolved_crash_during_execution",
+            Some("Attempted retry failed"),
+            Some(chrono::Utc::now().timestamp() + 300),
+        )
+        .await
+        .expect("update item");
+    assert_eq!(updated_id, item_id);
+
+    // 5. Mark resolved
+    recon_store
+        .mark_resolved(&item_id)
+        .await
+        .expect("mark resolved");
+    assert_eq!(recon_store.count_unresolved().await.expect("count"), 0);
+}

@@ -51,3 +51,7 @@ INFERNOS_TIMELINE.md
 Infernos_Project_Documentation.docx
 implementation_plan_infernos*
 .infernos/
+
+# Audit documents & internal development reports (keep local only)
+docs/audit/
+

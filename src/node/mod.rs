@@ -7,7 +7,9 @@ pub mod pricing;
 pub mod proxy;
 pub mod server;
 pub mod storage;
+pub mod worker;
 
 pub use config::NodeSettings;
 pub use pricing::PricingCalculator;
 pub use storage::Database;
+pub use worker::{ReconciliationWorker, WorkerConfig, WorkerStats};

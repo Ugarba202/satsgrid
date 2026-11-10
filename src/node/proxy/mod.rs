@@ -1,3 +1,3 @@
 pub mod openai;
 
-pub use openai::OpenAiProxy;
+pub use openai::{OpenAiProxy, TransportDispatchOutcome};

@@ -144,6 +144,13 @@ impl Database {
         crate::node::storage::request::RequestStore::new(self.pool.clone())
     }
 
+    /// Get a `ReconciliationStore` handle for PayGuard recovery operations.
+    pub fn reconciliation_store(
+        &self,
+    ) -> crate::node::storage::reconciliation::ReconciliationStore {
+        crate::node::storage::reconciliation::ReconciliationStore::new(self.pool.clone())
+    }
+
     /// Atomically finalize an inference request and its associated session reservation (if any)
     /// in a single SQLite transaction.
     ///
@@ -303,6 +310,148 @@ impl Database {
             .execute(&mut *conn)
             .await
             .map_err(|e| Error::Internal(format!("Failed to commit atomic finalization: {}", e)))?;
+
+        Ok(())
+    }
+
+    pub async fn commit_authorization_and_mark_processing(
+        &self,
+        payment_hash: &crate::common::types::PaymentHash,
+        request_id: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "Failed to acquire DB connection for commit_authorization_and_mark_processing: {}",
+                e
+            ))
+        })?;
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!("Failed to begin immediate transaction: {}", e))
+            })?;
+
+        // 1. Fetch & validate payment authorization
+        let auth_row: Option<(String, String)> = sqlx::query_as(
+            "SELECT state, request_id FROM payment_authorizations WHERE payment_hash = ?1",
+        )
+        .bind(&payment_hash.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|e| {
+            Error::Internal(format!(
+                "Failed to query payment authorization in commit_authorization: {}",
+                e
+            ))
+        })?;
+
+        let (auth_state, auth_req_id) = match auth_row {
+            Some(r) => r,
+            None => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(Error::Unauthorized(format!(
+                    "Payment authorization not found for payment hash '{}'",
+                    payment_hash.0
+                )));
+            }
+        };
+
+        if auth_state != "reserved" {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::Unauthorized(format!(
+                "Payment authorization cannot be consumed: current state is '{}'",
+                auth_state
+            )));
+        }
+
+        if auth_req_id != request_id {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::Unauthorized(format!(
+                "Payment authorization request_id mismatch: expected '{}', got '{}'",
+                request_id, auth_req_id
+            )));
+        }
+
+        // 2. Fetch & validate inference request
+        let req_row: Option<String> =
+            sqlx::query_scalar("SELECT status FROM inference_requests WHERE id = ?1")
+                .bind(request_id)
+                .fetch_optional(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!(
+                        "Failed to query inference request in commit_authorization: {}",
+                        e
+                    ))
+                })?;
+
+        let req_status = match req_row {
+            Some(s) => s,
+            None => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Err(Error::Internal(format!(
+                    "Inference request '{}' not found in commit_authorization",
+                    request_id
+                )));
+            }
+        };
+
+        if req_status != "reserved" {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::Internal(format!(
+                "Inference request '{}' cannot transition to processing: current status is '{}'",
+                request_id, req_status
+            )));
+        }
+
+        // 3. Update payment authorization to consumed
+        let update_auth = sqlx::query(
+            "UPDATE payment_authorizations SET state = 'consumed', settled_at = ?1 WHERE payment_hash = ?2 AND state = 'reserved'"
+        )
+        .bind(now)
+        .bind(&payment_hash.0)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to consume payment authorization: {}", e)))?;
+
+        if update_auth.rows_affected() == 0 {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::Internal(format!(
+                "Concurrent modification detected when consuming authorization for hash '{}'",
+                payment_hash.0
+            )));
+        }
+
+        // 4. Update inference request to processing
+        let update_req = sqlx::query(
+            "UPDATE inference_requests SET status = 'processing', started_at = ?1 WHERE id = ?2 AND status = 'reserved'"
+        )
+        .bind(now)
+        .bind(request_id)
+        .execute(&mut *conn)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to mark request processing: {}", e)))?;
+
+        if update_req.rows_affected() == 0 {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(Error::Internal(format!(
+                "Concurrent modification detected when updating request '{}' to processing",
+                request_id
+            )));
+        }
+
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to commit atomic authorization and dispatch transaction: {}",
+                    e
+                ))
+            })?;
 
         Ok(())
     }

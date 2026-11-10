@@ -92,6 +92,7 @@ export function ChatPanel({
     sessionStatus === "creating" ||
     sessionStatus === "payment_required" ||
     sessionStatus === "authorizing" ||
+    sessionStatus === "closed" ||
     sessionStatus === "error" ||
     isStreaming;
 
@@ -387,7 +388,13 @@ export function ChatPanel({
       <div className="p-4 bg-background border-t border-border/40">
         <div className="max-w-3xl mx-auto relative rounded-xl border border-border bg-card shadow-sm focus-within:ring-1 focus-within:ring-ring">
           <Textarea 
-            placeholder={isInputDisabled ? "Awaiting active session..." : "Send a message..."}
+            placeholder={
+              sessionStatus === "closed"
+                ? "This session is closed. Start a new session to continue chatting."
+                : isInputDisabled
+                ? "Awaiting active session..."
+                : "Send a message..."
+            }
             disabled={isInputDisabled}
             value={input}
             onChange={(e) => setInput(e.target.value)}

@@ -1,4 +1,4 @@
-export type SessionStatus = "idle" | "creating" | "payment_required" | "authorizing" | "active" | "error";
+export type SessionStatus = "idle" | "creating" | "payment_required" | "authorizing" | "active" | "closed" | "error";
 
 export interface SessionData {
   id?: string;

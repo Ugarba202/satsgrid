@@ -299,3 +299,114 @@ async fn test_e2e_replay_rejected_in_chat_completions() {
         "Replayed token must be rejected with 401 Unauthorized"
     );
 }
+
+#[tokio::test]
+async fn test_commit_authorization_and_mark_processing_atomic_success() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.payment_store();
+    let req_store = db.request_store();
+
+    let hash =
+        PaymentHash("1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff".to_string());
+    let req_id = "req_dispatch_1";
+
+    // 1. Reserve payment authorization
+    let res = store
+        .reserve_payment_hash(&hash, req_id, 2000000000, None)
+        .await
+        .unwrap();
+    assert_eq!(res, ReservationResult::Reserved);
+
+    // 2. Create inference request in reserved state
+    req_store
+        .create_request(
+            req_id,
+            Some(&hash),
+            None,
+            None,
+            None,
+            "llama3.2",
+            satsgrid::node::storage::RequestMode::NonStreaming,
+            satsgrid::common::types::Satoshis(10),
+        )
+        .await
+        .unwrap();
+
+    // 3. Atomically commit authorization and mark processing
+    db.commit_authorization_and_mark_processing(&hash, req_id)
+        .await
+        .expect("atomic dispatch transition should succeed");
+
+    // 4. Verify both transitions committed
+    let auth_state = store.get_authorization_state(&hash).await.unwrap();
+    assert_eq!(auth_state, Some("consumed".to_string()));
+
+    let req_record = req_store.get_request(req_id).await.unwrap().unwrap();
+    assert_eq!(
+        req_record.status,
+        satsgrid::node::storage::RequestStatus::Processing
+    );
+    assert!(req_record.started_at.is_some());
+}
+
+#[tokio::test]
+async fn test_commit_authorization_rollback_on_mismatches() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.payment_store();
+    let req_store = db.request_store();
+
+    let hash =
+        PaymentHash("9999222233334444555566667777888899990000aaaabbbbccccddddeeeeffff".to_string());
+    let req_id = "req_valid_1";
+
+    store
+        .reserve_payment_hash(&hash, req_id, 2000000000, None)
+        .await
+        .unwrap();
+
+    // 1. Test missing inference request -> fails and authorization remains reserved
+    let err_missing_req = db
+        .commit_authorization_and_mark_processing(&hash, req_id)
+        .await;
+    assert!(err_missing_req.is_err());
+    let state = store.get_authorization_state(&hash).await.unwrap();
+    assert_eq!(state, Some("reserved".to_string()));
+
+    // Create the request
+    req_store
+        .create_request(
+            req_id,
+            Some(&hash),
+            None,
+            None,
+            None,
+            "llama3.2",
+            satsgrid::node::storage::RequestMode::NonStreaming,
+            satsgrid::common::types::Satoshis(10),
+        )
+        .await
+        .unwrap();
+
+    // 2. Test wrong request_id -> fails and both remain reserved
+    let err_wrong_id = db
+        .commit_authorization_and_mark_processing(&hash, "req_other")
+        .await;
+    assert!(err_wrong_id.is_err());
+    let state = store.get_authorization_state(&hash).await.unwrap();
+    assert_eq!(state, Some("reserved".to_string()));
+    let req_record = req_store.get_request(req_id).await.unwrap().unwrap();
+    assert_eq!(
+        req_record.status,
+        satsgrid::node::storage::RequestStatus::Reserved
+    );
+
+    // 3. Test wrong payment hash -> fails
+    let bad_hash =
+        PaymentHash("0000000000000000000000000000000000000000000000000000000000000000".to_string());
+    let err_bad_hash = db
+        .commit_authorization_and_mark_processing(&bad_hash, req_id)
+        .await;
+    assert!(err_bad_hash.is_err());
+}

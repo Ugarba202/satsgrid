@@ -140,6 +140,17 @@ impl SatsGridServer {
             }
         };
 
+        let db_arc = Arc::new(db);
+        let recon_worker = Arc::new(crate::node::worker::ReconciliationWorker::new(
+            db_arc.clone(),
+            lightning_backend.clone(),
+            crate::node::worker::WorkerConfig::default(),
+        ));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker_handle = recon_worker.clone().spawn(shutdown_rx);
+        AppState::set_reconciliation_worker(recon_worker);
+
         let state = AppState {
             config: Arc::new(self.config.clone()),
             live_pricing: Arc::new(tokio::sync::RwLock::new(self.config.pricing.clone())),
@@ -149,7 +160,7 @@ impl SatsGridServer {
             proxy,
             stats: Arc::new(crate::node::api::NodeStats::default()),
             admin_token: Arc::new(admin_token),
-            db: Some(Arc::new(db)),
+            db: Some(db_arc),
             concurrency_manager,
         };
 
@@ -162,8 +173,14 @@ impl SatsGridServer {
             .await
             .map_err(|e| crate::common::error::Error::Internal(e.to_string()))?;
 
+        let server_shutdown = async move {
+            shutdown.await;
+            let _ = shutdown_tx.send(true);
+            let _ = worker_handle.await;
+        };
+
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
+            .with_graceful_shutdown(server_shutdown)
             .await
             .map_err(|e| crate::common::error::Error::Internal(e.to_string()))?;
 

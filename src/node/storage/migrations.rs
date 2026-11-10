@@ -233,6 +233,44 @@ pub const MIGRATIONS: &[Migration] = &[
         "#,
         requires_foreign_keys_disabled: false,
     },
+    Migration {
+        version: 8,
+        name: "session_closure_tracking_and_settlement",
+        sql: r#"
+        -- 1. Add closure metadata columns to sessions table
+        ALTER TABLE sessions ADD COLUMN closed_at INTEGER;
+        ALTER TABLE sessions ADD COLUMN closed_reason TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_closed_at ON sessions(closed_at) WHERE closed_at IS NOT NULL;
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 9,
+        name: "payguard_reconciliation_items",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS reconciliation_items (
+            id TEXT PRIMARY KEY,
+            item_type TEXT NOT NULL CHECK (item_type IN ('invoice', 'inference_request', 'session_late_funding')),
+            reference_id TEXT NOT NULL,
+            payment_hash TEXT,
+            session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+            status TEXT NOT NULL CHECK (status IN ('unresolved', 'in_progress', 'resolved', 'ignored')),
+            reason TEXT NOT NULL,
+            error_details TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            first_detected_at INTEGER NOT NULL,
+            last_attempt_at INTEGER,
+            next_retry_at INTEGER,
+            resolved_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_reconciliation_status ON reconciliation_items(status);
+        CREATE INDEX IF NOT EXISTS idx_reconciliation_next_retry ON reconciliation_items(next_retry_at) WHERE status = 'unresolved';
+        CREATE INDEX IF NOT EXISTS idx_reconciliation_reference ON reconciliation_items(reference_id);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
 ];
 
 /// Execute pending migrations against the SQLite pool in an atomic transaction.

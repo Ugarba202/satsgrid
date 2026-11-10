@@ -2,7 +2,7 @@ import { Message } from "@/types/inference";
 
 export interface StoredSession {
   id: string;
-  status: "active" | "exhausted" | "expired";
+  status: "active" | "exhausted" | "expired" | "closed";
   model: string;
   capability: string;
   budget_sats: number;
@@ -11,6 +11,8 @@ export interface StoredSession {
   preimage?: string;
   invoice?: string;
   created_at: string;
+  closed_at?: number;
+  closed_reason?: string;
   requests_count: number;
   messages?: Message[];
 }
@@ -71,6 +73,27 @@ export function updateStoredSessionBudget(
     }
   } catch (e) {
     console.error("Failed to update session budget", e);
+  }
+}
+
+export function markStoredSessionClosed(
+  id: string,
+  closedAt?: number,
+  reason?: string
+): void {
+  if (typeof window === "undefined") return;
+  try {
+    const sessions = getStoredSessions();
+    const session = sessions.find((s) => s.id === id);
+    if (session) {
+      session.status = "closed";
+      session.remaining_sats = 0;
+      session.closed_at = closedAt || Date.now();
+      session.closed_reason = reason;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(sessions));
+    }
+  } catch (e) {
+    console.error("Failed to mark session closed", e);
   }
 }
 

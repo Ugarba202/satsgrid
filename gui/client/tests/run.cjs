@@ -9,3 +9,4 @@ const jiti = createJiti(root, {
 });
 
 jiti("./tests/l402.test.ts");
+jiti("./tests/session_closure.test.ts");

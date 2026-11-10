@@ -84,15 +84,17 @@ pub async fn new_session(
     let uuid = uuid::Uuid::new_v4();
     let session_id = SessionId(uuid);
 
-    // Register pending session in the budget manager (persists as pending_payment in SQLite when db is active)
-    let default_expiry = chrono::Utc::now().timestamp() + 86400 * 30; // 30 days
+    // Register pending session and durable funding invoice atomically in SQLite
+    let funding_expiry_secs = state.config.lightning.session_funding_expiry_secs;
+    let expires_at = chrono::Utc::now().timestamp() + funding_expiry_secs as i64;
     state
         .budget_manager
-        .create_pending_session(
+        .create_pending_session_with_invoice(
             &session_id,
-            Some(&invoice.payment_hash),
+            &invoice.payment_hash,
+            &invoice.bolt11,
             budget,
-            default_expiry,
+            expires_at,
         )
         .await?;
 
@@ -174,9 +176,26 @@ pub async fn chat_completions(
             .await
             .map_err(|e| Error::Internal(e.to_string()))?;
 
+        let ppr_expiry_secs = state.config.lightning.pay_per_request_expiry_secs;
+        let invoice_expires_at = (now + ppr_expiry_secs) as i64;
+
+        // Persist invoice in durable registry before emitting 402 challenge
+        if let Some(db) = &state.db {
+            db.invoice_store()
+                .create_invoice(
+                    &invoice.payment_hash,
+                    &invoice.bolt11,
+                    cost,
+                    crate::node::storage::InvoicePurpose::PayPerRequest,
+                    None,
+                    invoice_expires_at,
+                )
+                .await?;
+        }
+
         let mut caveats = vec![
             Caveat::Capability("inference".to_string()),
-            Caveat::ExpiresAt(now + 3600),
+            Caveat::ExpiresAt(now + ppr_expiry_secs),
         ];
         if let Some(model_name) = req_model {
             caveats.push(Caveat::Model(model_name.to_string()));
@@ -267,6 +286,14 @@ pub async fn chat_completions(
             .activate_session_if_pending(session_id, &payment_hash)
             .await?;
 
+        // Update invoice settlement status in durable registry if stored
+        if let Some(db) = &state.db {
+            let _ = db
+                .invoice_store()
+                .mark_settled(&payment_hash, now as i64)
+                .await;
+        }
+
         // Check session idempotency key if provided
         if let (Some(db), Some(idem_key)) = (&state.db, idempotency_key) {
             let req_store = db.request_store();
@@ -346,21 +373,21 @@ pub async fn chat_completions(
         // Pay-per-request mode: enforce single-use authorization in persistent storage
         if let Some(db) = &state.db {
             let expires_at = credentials.macaroon.expires_at().unwrap_or(now + 3600);
+            let fingerprint = validated.compute_canonical_fingerprint();
 
             let store = db.payment_store();
             let reservation = store
-                .reserve_payment_hash(
+                .reserve_payment_hash_with_fingerprint(
                     &payment_hash,
                     &internal_request_id,
                     expires_at,
                     idempotency_key,
+                    Some(&fingerprint),
                 )
                 .await?;
 
             match reservation {
-                crate::node::storage::ReservationResult::Reserved => {
-                    store.mark_settled_and_consumed(&payment_hash).await?;
-                }
+                crate::node::storage::ReservationResult::Reserved => {}
                 crate::node::storage::ReservationResult::AlreadyUsed {
                     state: auth_state, ..
                 } => {
@@ -388,14 +415,26 @@ pub async fn chat_completions(
                     cost,
                 )
                 .await?;
+
+            // Atomically consume payment authorization and mark inference request processing
+            db.commit_authorization_and_mark_processing(&payment_hash, &internal_request_id)
+                .await?;
+
+            // Mark invoice settled in durable registry
+            let _ = db
+                .invoice_store()
+                .mark_settled(&payment_hash, now as i64)
+                .await;
         }
     }
 
-    // Durable Dispatch Boundary: Commit 'processing' state before upstream HTTP call
-    if let Some(db) = &state.db {
-        db.request_store()
-            .mark_processing(&internal_request_id)
-            .await?;
+    // For session requests: Durable Dispatch Boundary: Commit 'processing' state before upstream HTTP call
+    if session_opt.is_some() {
+        if let Some(db) = &state.db {
+            db.request_store()
+                .mark_processing(&internal_request_id)
+                .await?;
+        }
     }
 
     let upstream_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -766,9 +805,48 @@ pub async fn node_stats(
         .total_sats_earned
         .load(std::sync::atomic::Ordering::SeqCst);
 
+    let (pending_inv, settled_inv, unresolved_recon, worker_stats) = if let Some(db) = &state.db {
+        let inv_store = db.invoice_store();
+        let recon_store = db.reconciliation_store();
+        let p = inv_store
+            .count_by_status(crate::node::storage::InvoiceStatus::Pending)
+            .await
+            .unwrap_or(0);
+        let s = inv_store
+            .count_by_status(crate::node::storage::InvoiceStatus::Settled)
+            .await
+            .unwrap_or(0);
+        let u = recon_store.count_unresolved().await.unwrap_or(0);
+        let ws = if let Some(w) = AppState::reconciliation_worker() {
+            let st = w.stats().await;
+            Some(json!({
+                "last_scan_timestamp": st.last_scan_timestamp,
+                "scans_completed": st.scans_completed,
+                "invoices_checked": st.invoices_checked,
+                "invoices_settled": st.invoices_settled,
+                "invoices_expired": st.invoices_expired,
+                "items_reconciled": st.items_reconciled,
+                "last_error": st.last_error,
+            }))
+        } else {
+            None
+        };
+        (p, s, u, ws)
+    } else {
+        (0, 0, 0, None)
+    };
+
     Ok(Json(json!({
         "total_requests": requests,
         "total_sats_earned": earned,
+        "invoices": {
+            "pending": pending_inv,
+            "settled": settled_inv,
+        },
+        "reconciliation": {
+            "unresolved_items": unresolved_recon,
+            "worker": worker_stats,
+        }
     })))
 }
 

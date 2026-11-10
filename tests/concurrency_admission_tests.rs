@@ -833,3 +833,132 @@ async fn test_simultaneous_idempotency_race_rolls_back_losing_reservation() {
     // 6. Concurrency permits: all 5 global permits must be returned
     assert_eq!(ctx.concurrency_manager.global_available_permits(), 5);
 }
+
+#[tokio::test]
+async fn test_concurrent_session_closure_and_inference_interlock() {
+    let cfg = ConcurrencyConfig {
+        max_concurrent_requests: 10,
+        max_concurrent_per_session: 10,
+        admission_timeout_secs: 5,
+    };
+    let ctx = setup_test_context(cfg).await;
+
+    // Upstream takes 150ms to simulate in-flight work
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({
+                    "id": "chatcmpl-concurrent-close",
+                    "choices": [{"message": {"role": "assistant", "content": "I am in flight"}}]
+                }))
+                .set_delay(std::time::Duration::from_millis(150)),
+        )
+        .mount(&ctx.mock_server)
+        .await;
+
+    let (session_id, auth_header) = fund_session(&ctx, 500).await;
+
+    // Launch inference request in background
+    let app1 = ctx.app.clone();
+    let auth1 = auth_header.clone();
+    let inf_handle = tokio::spawn(async move {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .header("Authorization", &auth1)
+            .body(Body::from(
+                json!({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "test"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        app1.oneshot(req).await.unwrap()
+    });
+
+    // Wait slightly so request acquires permit and reserves funds in SQLite
+    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+
+    // Attempt closure while in-flight
+    let app2 = ctx.app.clone();
+    let auth2 = auth_header.clone();
+    let close_req = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &auth2)
+        .body(Body::from(json!({ "reason": "race_close" }).to_string()))
+        .unwrap();
+
+    let close_resp = app2.oneshot(close_req).await.unwrap();
+
+    // Since in-flight request reserved 10 sats, closure must either:
+    // 1. Fail with 500 ActiveRequestsPending if evaluated while reserved > 0
+    // 2. Or succeed after inference completes
+    let close_status = close_resp.status();
+    assert!(
+        close_status == StatusCode::INTERNAL_SERVER_ERROR || close_status == StatusCode::OK,
+        "Closure status during in-flight request was unexpected: {}",
+        close_status
+    );
+
+    // Wait for in-flight inference to complete
+    let inf_resp = inf_handle.await.unwrap();
+    assert_eq!(inf_resp.status(), StatusCode::OK);
+
+    // Close session cleanly now that in-flight request is done
+    let app3 = ctx.app.clone();
+    let auth3 = auth_header.clone();
+    let close_req2 = Request::builder()
+        .method("POST")
+        .uri("/v1/session/close")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &auth3)
+        .body(Body::from(json!({ "reason": "clean_close" }).to_string()))
+        .unwrap();
+
+    let close_resp2 = app3.oneshot(close_req2).await.unwrap();
+    assert_eq!(close_resp2.status(), StatusCode::OK);
+
+    let session = ctx
+        .db
+        .session_store()
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        satsgrid::node::storage::SessionStatus::Closed
+    );
+    assert_eq!(session.remaining_sats, Satoshis(0));
+    assert_eq!(session.reserved_sats, Satoshis(0));
+    assert_eq!(session.spent_sats, Satoshis(500));
+    assert_eq!(
+        session.remaining_sats.0 + session.reserved_sats.0 + session.spent_sats.0,
+        session.total_budget_sats.0,
+        "Invariant preserved: remaining + reserved + spent == total"
+    );
+
+    // Subsequent inference on closed session must fail immediately
+    let app4 = ctx.app.clone();
+    let inf_req_after = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .header("Authorization", &auth_header)
+        .body(Body::from(
+            json!({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "post close attempt"}]
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let inf_resp_after = app4.oneshot(inf_req_after).await.unwrap();
+    assert_eq!(inf_resp_after.status(), StatusCode::UNAUTHORIZED);
+}

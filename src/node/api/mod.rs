@@ -1,5 +1,6 @@
 pub mod handlers;
 pub mod routes;
+pub mod session_closure;
 pub mod validation;
 
 use crate::config::schema::{NodeConfig, PricingConfig};
@@ -33,7 +34,18 @@ pub struct AppState {
     pub concurrency_manager: Arc<ConcurrencyManager>,
 }
 
+// In-process global reference for optional reconciliation worker to avoid breaking AppState struct construction across 20+ test files
+static RECON_WORKER: tokio::sync::OnceCell<Arc<crate::node::worker::ReconciliationWorker>> =
+    tokio::sync::OnceCell::const_new();
+
 impl AppState {
+    pub fn set_reconciliation_worker(worker: Arc<crate::node::worker::ReconciliationWorker>) {
+        let _ = RECON_WORKER.set(worker);
+    }
+
+    pub fn reconciliation_worker() -> Option<Arc<crate::node::worker::ReconciliationWorker>> {
+        RECON_WORKER.get().cloned()
+    }
     pub async fn pricing_calculator(&self) -> PricingCalculator {
         let pricing = self.live_pricing.read().await.clone();
         PricingCalculator::new(pricing)

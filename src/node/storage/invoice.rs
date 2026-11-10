@@ -334,4 +334,76 @@ impl InvoiceStore {
 
         Ok(res.rows_affected() > 0)
     }
+
+    /// Retrieve a batch of pending invoices up to the given limit.
+    pub async fn get_pending_invoices(&self, limit: i64) -> Result<Vec<InvoiceRecord>> {
+        let query = r#"
+            SELECT payment_hash, bolt11, amount_sats, purpose, session_id,
+                   status, created_at, expires_at, settled_at, updated_at
+            FROM invoices
+            WHERE status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT ?1
+        "#;
+
+        let rows: Vec<InvoiceRow> = sqlx::query_as(query)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to fetch pending invoices: {}", e)))?;
+
+        let mut results = Vec::new();
+        for (
+            hash,
+            bolt11,
+            amount,
+            purpose_str,
+            session_opt,
+            status_str,
+            created_at,
+            expires_at,
+            settled_at,
+            updated_at,
+        ) in rows
+        {
+            let purpose = InvoicePurpose::from_str(&purpose_str)
+                .map_err(|_| Error::Internal("Invalid invoice purpose in DB".to_string()))?;
+            let status = InvoiceStatus::from_str(&status_str)
+                .map_err(|_| Error::Internal("Invalid invoice status in DB".to_string()))?;
+            let session_id = match session_opt {
+                Some(s) => Some(
+                    Uuid::parse_str(&s)
+                        .map(SessionId)
+                        .map_err(|e| Error::Internal(format!("Invalid UUID in invoice: {}", e)))?,
+                ),
+                None => None,
+            };
+
+            results.push(InvoiceRecord {
+                payment_hash: PaymentHash(hash),
+                bolt11,
+                amount_sats: Satoshis(amount as u64),
+                purpose,
+                session_id,
+                status,
+                created_at,
+                expires_at,
+                settled_at,
+                updated_at,
+            });
+        }
+
+        Ok(results)
+    }
+
+    /// Count total invoices by status.
+    pub async fn count_by_status(&self, status: InvoiceStatus) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE status = ?1")
+            .bind(status.as_str())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to count invoices: {}", e)))?;
+
+        Ok(count)
+    }
 }

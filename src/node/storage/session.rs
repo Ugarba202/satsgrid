@@ -88,6 +88,27 @@ pub struct SessionRecord {
     pub created_at: i64,
     pub expires_at: i64,
     pub updated_at: i64,
+    pub closed_at: Option<i64>,
+    pub closed_reason: Option<String>,
+}
+
+/// Outcome of attempting to close a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCloseResult {
+    /// Session was closed successfully.
+    Closed {
+        total_budget_sats: Satoshis,
+        remaining_sats: Satoshis,
+        reserved_sats: Satoshis,
+        spent_sats: Satoshis,
+        closed_at: i64,
+    },
+    /// Session was already in closed state.
+    AlreadyClosed { closed_at: Option<i64> },
+    /// Session does not exist in storage.
+    NotFound,
+    /// Session has active reserved budget from in-flight requests.
+    ActiveRequestsPending { reserved_sats: Satoshis },
 }
 
 /// Outcome of attempting to reserve budget from a session.
@@ -140,6 +161,8 @@ type SessionRow = (
     i64,
     i64,
     i64,
+    Option<i64>,
+    Option<String>,
 );
 
 /// Durable session store providing atomic, persistent budget management.
@@ -190,6 +213,88 @@ impl SessionStore {
                 }
                 _ => Error::Internal(format!("Failed to insert pending session: {}", e)),
             })?;
+
+        Ok(())
+    }
+
+    /// Atomically insert a pending session and its funding invoice into SQLite within a single transaction.
+    ///
+    /// Preserves strict linkage between the session, the payment hash, and the invoice registry.
+    pub async fn create_pending_session_with_invoice(
+        &self,
+        session_id: &SessionId,
+        payment_hash: &PaymentHash,
+        bolt11: &str,
+        total_budget: Satoshis,
+        expires_at: i64,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            Error::Internal(format!(
+                "Failed to begin transaction for pending session with invoice: {}",
+                e
+            ))
+        })?;
+
+        // 1. Insert pending session
+        let insert_session = r#"
+            INSERT INTO sessions (
+                id, payment_hash, total_budget_sats, remaining_sats,
+                reserved_sats, spent_sats, status, created_at, expires_at, updated_at
+            ) VALUES (?1, ?2, ?3, 0, 0, 0, 'pending_payment', ?4, ?5, ?4)
+        "#;
+
+        sqlx::query(insert_session)
+            .bind(session_id.0.to_string())
+            .bind(&payment_hash.0)
+            .bind(total_budget.0 as i64)
+            .bind(now)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref db_err) if db_err.is_unique_violation() => {
+                    Error::Internal(format!(
+                        "Session or funding payment hash already exists: {}",
+                        db_err
+                    ))
+                }
+                _ => Error::Internal(format!("Failed to insert pending session: {}", e)),
+            })?;
+
+        // 2. Insert invoice record
+        let insert_invoice = r#"
+            INSERT INTO invoices (
+                payment_hash, bolt11, amount_sats, purpose, session_id,
+                status, created_at, expires_at, settled_at, updated_at
+            ) VALUES (?1, ?2, ?3, 'session_funding', ?4, 'pending', ?5, ?6, NULL, ?5)
+        "#;
+
+        sqlx::query(insert_invoice)
+            .bind(&payment_hash.0)
+            .bind(bolt11)
+            .bind(total_budget.0 as i64)
+            .bind(session_id.0.to_string())
+            .bind(now)
+            .bind(expires_at)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| match e {
+                sqlx::Error::Database(ref db_err) if db_err.is_unique_violation() => {
+                    Error::Internal(format!(
+                        "Invoice with payment hash already exists: {}",
+                        db_err
+                    ))
+                }
+                _ => Error::Internal(format!("Failed to insert funding invoice: {}", e)),
+            })?;
+
+        tx.commit().await.map_err(|e| {
+            Error::Internal(format!(
+                "Failed to commit pending session with invoice: {}",
+                e
+            ))
+        })?;
 
         Ok(())
     }
@@ -412,7 +517,8 @@ impl SessionStore {
     pub async fn get_session(&self, session_id: &SessionId) -> Result<Option<SessionRecord>> {
         let query = r#"
             SELECT id, payment_hash, total_budget_sats, remaining_sats,
-                   reserved_sats, spent_sats, status, created_at, expires_at, updated_at
+                   reserved_sats, spent_sats, status, created_at, expires_at, updated_at,
+                   closed_at, closed_reason
             FROM sessions
             WHERE id = ?1
         "#;
@@ -435,6 +541,8 @@ impl SessionStore {
                 created_at,
                 expires_at,
                 updated_at,
+                closed_at,
+                closed_reason,
             )) => {
                 let parsed_id = Uuid::parse_str(&id_str)
                     .map(SessionId)
@@ -454,6 +562,8 @@ impl SessionStore {
                     created_at,
                     expires_at,
                     updated_at,
+                    closed_at,
+                    closed_reason,
                 }))
             }
             None => Ok(None),
@@ -954,6 +1064,176 @@ impl SessionStore {
         .map_err(|e| Error::Internal(format!("Failed to mark ambiguous reservations: {}", e)))?;
 
         Ok(recovered_count)
+    }
+
+    /// Atomically close a session in persistent storage.
+    ///
+    /// Lifecycle semantics:
+    /// - If `status == 'closed'`, returns `SessionCloseResult::AlreadyClosed`.
+    /// - If `reserved_sats > 0`, in-flight requests or un-reconciled reservations exist:
+    ///   rejects closure with `SessionCloseResult::ActiveRequestsPending { reserved_sats }`.
+    /// - If `status == 'pending_payment'`, transitions directly to `'closed'`, zeroes remaining balance,
+    ///   and preserves the `(status = 'closed' AND remaining_sats + reserved_sats + spent_sats = total_budget_sats)` constraint
+    ///   by setting `spent_sats = total_budget_sats` (forfeited budget).
+    /// - If `status == 'active'` or `'expired'` or `'exhausted'`:
+    ///   transitions to `'closed'`, sets `closed_at = now`, records `closed_reason`,
+    ///   transfers any `remaining_sats` to `spent_sats` (forfeiture / closure settlement),
+    ///   and appends an immutable audit event to `accounting_entries`.
+    pub async fn close_session(
+        &self,
+        session_id: &SessionId,
+        reason: Option<&str>,
+    ) -> Result<SessionCloseResult> {
+        let now = chrono::Utc::now().timestamp();
+
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "Failed to acquire connection for session closure: {}",
+                e
+            ))
+        })?;
+
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to begin immediate transaction for closure: {}",
+                    e
+                ))
+            })?;
+
+        let select_query = r#"
+            SELECT total_budget_sats, remaining_sats, reserved_sats, spent_sats, status, closed_at
+            FROM sessions
+            WHERE id = ?1
+        "#;
+
+        let row: Option<(i64, i64, i64, i64, String, Option<i64>)> = sqlx::query_as(select_query)
+            .bind(session_id.0.to_string())
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to query session for closure: {}", e)))?;
+
+        let (total, remaining, reserved, spent, status_str, closed_at_opt) = match row {
+            Some(r) => r,
+            None => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                return Ok(SessionCloseResult::NotFound);
+            }
+        };
+
+        let status = SessionStatus::from_str(&status_str)
+            .map_err(|_| Error::Internal("Invalid session status in DB".to_string()))?;
+
+        // 1. Idempotency: If already closed, return AlreadyClosed immediately
+        if status == SessionStatus::Closed {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Ok(SessionCloseResult::AlreadyClosed {
+                closed_at: closed_at_opt,
+            });
+        }
+
+        // 2. Active in-flight requests guard
+        if reserved > 0 {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Ok(SessionCloseResult::ActiveRequestsPending {
+                reserved_sats: Satoshis(reserved as u64),
+            });
+        }
+
+        // 3. Balance accounting adjustments:
+        // For active/expired/exhausted sessions, remaining satoshis are forfeited/settled upon closure,
+        // transferring to spent_sats to satisfy: remaining_sats + reserved_sats + spent_sats = total_budget_sats.
+        // For pending_payment sessions, no funds were deposited (remaining = 0, spent = 0, reserved = 0),
+        // so total_budget is zeroed to satisfy: 0 + 0 + 0 = 0 under the non-pending constraint.
+        let (final_total, final_spent) = if status == SessionStatus::PendingPayment {
+            (0, 0)
+        } else {
+            (total, spent + remaining)
+        };
+        let closure_reason = reason.unwrap_or("voluntary_caller_close");
+
+        let update_query = r#"
+            UPDATE sessions
+            SET status = 'closed',
+                total_budget_sats = ?1,
+                remaining_sats = 0,
+                spent_sats = ?2,
+                closed_at = ?3,
+                closed_reason = ?4,
+                updated_at = ?3
+            WHERE id = ?5 AND status != 'closed' AND reserved_sats = 0
+        "#;
+
+        let result = sqlx::query(update_query)
+            .bind(final_total)
+            .bind(final_spent)
+            .bind(now)
+            .bind(closure_reason)
+            .bind(session_id.0.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to update session to closed: {}", e)))?;
+
+        if result.rows_affected() == 0 {
+            // Concurrent closure won or reserved_sats changed concurrently
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            let fresh = self.get_session(session_id).await?;
+            if let Some(s) = fresh {
+                if s.status == SessionStatus::Closed {
+                    return Ok(SessionCloseResult::AlreadyClosed {
+                        closed_at: s.closed_at,
+                    });
+                } else if s.reserved_sats.0 > 0 {
+                    return Ok(SessionCloseResult::ActiveRequestsPending {
+                        reserved_sats: s.reserved_sats,
+                    });
+                }
+            }
+            return Ok(SessionCloseResult::NotFound);
+        }
+
+        // 4. Record accounting event if funds were active
+        if status != SessionStatus::PendingPayment && remaining > 0 {
+            let entry_uuid = Uuid::new_v4().to_string();
+            let desc = format!("Session closed: {} unused sats forfeited", remaining);
+            let ledger_query = r#"
+                INSERT INTO accounting_entries (
+                    entry_uuid, session_id, reservation_id, entry_type, amount_sats, created_at, description
+                ) VALUES (?1, ?2, NULL, 'session_debit', ?3, ?4, ?5)
+            "#;
+
+            sqlx::query(ledger_query)
+                .bind(&entry_uuid)
+                .bind(session_id.0.to_string())
+                .bind(remaining)
+                .bind(now)
+                .bind(desc)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| {
+                    Error::Internal(format!("Failed to record closure ledger entry: {}", e))
+                })?;
+        }
+
+        sqlx::query("COMMIT")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to commit session closure transaction: {}",
+                    e
+                ))
+            })?;
+
+        Ok(SessionCloseResult::Closed {
+            total_budget_sats: Satoshis(final_total as u64),
+            remaining_sats: Satoshis(0),
+            reserved_sats: Satoshis(0),
+            spent_sats: Satoshis(final_spent as u64),
+            closed_at: now,
+        })
     }
 
     /// Read accounting ledger entries for a session to audit satoshi movements.
