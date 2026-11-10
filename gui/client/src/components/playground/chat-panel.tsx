@@ -5,6 +5,8 @@ import { Send, Bot, User, Lock, Zap } from "lucide-react";
 import { StatusBadge } from "@/components/satsgrid/status-badge";
 import { SessionStatus, SessionData } from "@/types/session";
 import { SatsAmount } from "@/components/satsgrid/sats-amount";
+import { resolveNetworkIdentity } from "@/lib/api/network";
+import { fetchNodeHealth, type NodeLightningInfo } from "@/lib/api/node";
 import { Message } from "@/types/inference";
 import { useState, useEffect, KeyboardEvent } from "react";
 
@@ -39,6 +41,19 @@ export function ChatPanel({
   const [copied, setCopied] = useState(false);
   const [preimageError, setPreimageError] = useState<string | null>(null);
   const [isPayingMock, setIsPayingMock] = useState(false);
+  const [nodeLightning, setNodeLightning] = useState<NodeLightningInfo | null>(null);
+
+  useEffect(() => {
+    fetchNodeHealth()
+      .then((health) => {
+        if (health.lightning) {
+          setNodeLightning(health.lightning);
+        }
+      })
+      .catch(() => {
+        // Node metadata unavailable; fallback to invoice heuristics
+      });
+  }, []);
 
   useEffect(() => {
     if (typeof window !== "undefined") {
@@ -144,13 +159,8 @@ export function ChatPanel({
   };
 
   const invoiceStr = sessionData.invoice || "";
-  const networkName = invoiceStr.startsWith("lnbcrt")
-    ? "Bitcoin Regtest (Polar)"
-    : invoiceStr.startsWith("lntb")
-    ? "Bitcoin Testnet"
-    : invoiceStr.startsWith("lnbc")
-    ? "Bitcoin Mainnet"
-    : "Lightning Network";
+  const networkInfo = resolveNetworkIdentity(nodeLightning, invoiceStr);
+  const networkName = networkInfo.displayName;
 
   return (
     <div className="flex-1 flex flex-col h-full relative">

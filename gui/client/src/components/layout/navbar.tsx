@@ -6,6 +6,8 @@ import { usePathname } from "next/navigation";
 import dynamic from "next/dynamic";
 import { Zap, Server, User, ExternalLink, HardDrive } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { fetchNodeHealth, type NodeLightningInfo } from "@/lib/api/node";
+import { resolveNetworkIdentity } from "@/lib/api/network";
 
 const ConnectButton = dynamic(
   () => import("@getalby/bitcoin-connect-react").then((mod) => mod.Button),
@@ -16,12 +18,29 @@ export function Navbar() {
   const pathname = usePathname();
   const isOperatorView = pathname.startsWith("/node");
   const [network, setNetwork] = useState<"regtest" | "testnet" | "mainnet">("regtest");
+  const [nodeLightning, setNodeLightning] = useState<NodeLightningInfo | null>(null);
 
   useEffect(() => {
     import("@getalby/bitcoin-connect").then(({ init }) => {
       init({ appName: "SatsGrid" });
     });
+
+    fetchNodeHealth()
+      .then((health) => {
+        if (health.lightning) {
+          setNodeLightning(health.lightning);
+          const net = health.lightning.network.toLowerCase();
+          if (net === "mainnet" || net === "testnet" || net === "regtest") {
+            setNetwork(net);
+          }
+        }
+      })
+      .catch(() => {
+        // Node metadata unavailable; keep default
+      });
   }, []);
+
+  const authoritativeNet = resolveNetworkIdentity(nodeLightning);
 
   return (
     <header className="sticky top-0 z-50 w-full border-b border-border/40 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
@@ -57,7 +76,7 @@ export function Navbar() {
                 Node Dashboard
               </Link>
               <Link
-                href="https://github.com/infernos-ai/infernos#readme"
+                href="https://github.com/Ugarba202/satsgrid#readme"
                 target="_blank"
                 className="hover:text-foreground transition-colors flex items-center gap-1 text-xs text-muted-foreground"
               >
@@ -79,7 +98,7 @@ export function Navbar() {
                 My Sessions
               </Link>
               <Link
-                href="https://github.com/infernos-ai/infernos#readme"
+                href="https://github.com/Ugarba202/satsgrid#readme"
                 target="_blank"
                 className="hover:text-foreground transition-colors flex items-center gap-1 text-xs text-muted-foreground"
               >
@@ -112,28 +131,39 @@ export function Navbar() {
               <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full border border-border/60 bg-card text-xs font-mono shadow-sm">
                 <div
                   className={`w-2 h-2 rounded-full ${
-                    network === "mainnet"
+                    nodeLightning?.backend === "mock"
+                      ? "bg-muted-foreground"
+                      : network === "mainnet"
                       ? "bg-lightning"
                       : network === "testnet"
                       ? "bg-primary"
                       : "bg-success"
                   }`}
                 />
-                <select
-                  value={network}
-                  onChange={(e) => setNetwork(e.target.value as "regtest" | "testnet" | "mainnet")}
-                  className="bg-transparent text-xs font-mono font-medium focus:outline-none cursor-pointer text-muted-foreground hover:text-foreground"
-                >
-                  <option value="regtest" className="bg-popover text-popover-foreground">
-                    Regtest (Polar)
-                  </option>
-                  <option value="testnet" className="bg-popover text-popover-foreground">
-                    Testnet / Signet
-                  </option>
-                  <option value="mainnet" className="bg-popover text-popover-foreground">
-                    Bitcoin Mainnet
-                  </option>
-                </select>
+                {nodeLightning ? (
+                  <span
+                    className="text-xs font-mono font-medium text-muted-foreground"
+                    title={`Authoritative Node Backend: ${nodeLightning.backend}, Network: ${nodeLightning.network}`}
+                  >
+                    {authoritativeNet.displayName}
+                  </span>
+                ) : (
+                  <select
+                    value={network}
+                    onChange={(e) => setNetwork(e.target.value as "regtest" | "testnet" | "mainnet")}
+                    className="bg-transparent text-xs font-mono font-medium focus:outline-none cursor-pointer text-muted-foreground hover:text-foreground"
+                  >
+                    <option value="regtest" className="bg-popover text-popover-foreground">
+                      Regtest (Polar)
+                    </option>
+                    <option value="testnet" className="bg-popover text-popover-foreground">
+                      Testnet / Signet
+                    </option>
+                    <option value="mainnet" className="bg-popover text-popover-foreground">
+                      Bitcoin Mainnet
+                    </option>
+                  </select>
+                )}
               </div>
 
               <ConnectButton />

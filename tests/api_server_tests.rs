@@ -17,24 +17,7 @@ use tower::ServiceExt; // for `oneshot`
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn setup_app() -> axum::Router {
-    let config = NodeConfig {
-        server: satsgrid::config::schema::ServerConfig {
-            host: "127.0.0.1".to_string(),
-            port: 8080,
-            admin_token: None,
-            ..Default::default()
-        },
-        pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
-        upstream: satsgrid::config::schema::UpstreamConfig {
-            url: "http://localhost:8080".to_string(),
-            ..Default::default()
-        },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
-        data_dir: ".satsgrid_test_data".to_string(),
-        ..Default::default()
-    };
-
+fn setup_app_with_config(config: NodeConfig) -> axum::Router {
     let proxy = OpenAiProxy::new(config.upstream.url.clone());
 
     let state = AppState {
@@ -60,6 +43,27 @@ fn setup_app() -> axum::Router {
     create_routes(state)
 }
 
+fn setup_app() -> axum::Router {
+    let config = NodeConfig {
+        server: satsgrid::config::schema::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            admin_token: None,
+            ..Default::default()
+        },
+        pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
+        upstream: satsgrid::config::schema::UpstreamConfig {
+            url: "http://localhost:8080".to_string(),
+            ..Default::default()
+        },
+        lightning: satsgrid::config::schema::LightningConfig::default(),
+        data_dir: ".satsgrid_test_data".to_string(),
+        ..Default::default()
+    };
+
+    setup_app_with_config(config)
+}
+
 #[tokio::test]
 async fn test_health_endpoint() {
     let app = setup_app();
@@ -75,6 +79,90 @@ async fn test_health_endpoint() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["service"], "satsgrid-node");
+    assert_eq!(body["lightning"]["backend"], "mock");
+    assert_eq!(body["lightning"]["network"], "testnet");
+}
+
+#[tokio::test]
+async fn test_health_endpoint_lnd_mainnet() {
+    let mut config = NodeConfig::default();
+    config.lightning.backend = satsgrid::config::schema::LightningBackendType::Lnd;
+    config.lightning.network = satsgrid::config::schema::BitcoinNetwork::Mainnet;
+    config.lightning.lnd_rpc_host = Some("https://127.0.0.1:10009".to_string());
+    config.lightning.lnd_macaroon_path = Some("/tmp/fake_admin.macaroon".to_string());
+    config.lightning.lnd_tls_cert_path = Some("/tmp/fake_tls.cert".to_string());
+
+    let app = setup_app_with_config(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["service"], "satsgrid-node");
+    assert_eq!(body["lightning"]["backend"], "lnd_rest");
+    assert_eq!(body["lightning"]["network"], "mainnet");
+
+    // Ensure no sensitive configuration credentials leaked in public health response
+    assert!(body.get("admin_token").is_none());
+    assert!(body["lightning"].get("lnd_macaroon_path").is_none());
+    assert!(body["lightning"].get("lnd_tls_cert_path").is_none());
+    assert!(body["lightning"].get("lnd_rpc_host").is_none());
+    assert!(body["lightning"].get("nwc_uri").is_none());
+}
+
+#[tokio::test]
+async fn test_health_endpoint_nwc_regtest() {
+    let mut config = NodeConfig::default();
+    config.lightning.backend = satsgrid::config::schema::LightningBackendType::Nwc;
+    config.lightning.network = satsgrid::config::schema::BitcoinNetwork::Regtest;
+    config.lightning.nwc_uri = Some("nostr+walletconnect://secret_key_should_not_leak".to_string());
+
+    let app = setup_app_with_config(config);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["service"], "satsgrid-node");
+    assert_eq!(body["lightning"]["backend"], "nwc");
+    assert_eq!(body["lightning"]["network"], "regtest");
+
+    // Verify secret NWC URI does NOT leak
+    assert!(body["lightning"].get("nwc_uri").is_none());
+    let raw_str = serde_json::to_string(&body).unwrap();
+    assert!(!raw_str.contains("secret_key_should_not_leak"));
 }
 
 #[tokio::test]

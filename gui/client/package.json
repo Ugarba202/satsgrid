@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "test": "node tests/run.cjs",
     "start": "next start",
     "lint": "eslint"
   },

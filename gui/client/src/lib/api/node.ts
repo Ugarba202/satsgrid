@@ -1,7 +1,13 @@
+export interface NodeLightningInfo {
+  backend: string; // "mock" | "lnd_rest" | "nwc"
+  network: string; // "mainnet" | "testnet" | "regtest" | "signet"
+}
+
 export interface NodeHealthResponse {
   status: string;
   service: string;
-  version: string;
+  version?: string;
+  lightning?: NodeLightningInfo;
 }
 
 export interface ModelEntry {
@@ -50,11 +56,10 @@ export async function fetchNodeModels(): Promise<ModelEntry[]> {
   return Array.isArray(data.data) ? data.data : [];
 }
 
-export async function fetchNodeStats(adminToken?: string): Promise<NodeStatsResponse> {
-  const headers: Record<string, string> = {};
-  if (adminToken) {
-    headers["Authorization"] = `Bearer ${adminToken}`;
-  }
+export async function fetchNodeStats(adminToken: string): Promise<NodeStatsResponse> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${adminToken}`,
+  };
   const res = await fetch("/v1/node/stats", { headers, cache: "no-store" });
   if (!res.ok) {
     throw new Error(`Node stats failed: ${res.status}`);
@@ -62,14 +67,32 @@ export async function fetchNodeStats(adminToken?: string): Promise<NodeStatsResp
   return res.json();
 }
 
-export async function fetchNodeConfig(adminToken?: string): Promise<NodeConfigResponse> {
-  const headers: Record<string, string> = {};
-  if (adminToken) {
-    headers["Authorization"] = `Bearer ${adminToken}`;
-  }
+export async function fetchNodeConfig(adminToken: string): Promise<NodeConfigResponse> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${adminToken}`,
+  };
   const res = await fetch("/v1/node/config", { headers, cache: "no-store" });
   if (!res.ok) {
     throw new Error(`Node config failed: ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function updateNodePricing(
+  adminToken: string,
+  pricing: NonNullable<NodeConfigResponse["pricing"]>
+): Promise<{ status: string }> {
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${adminToken}`,
+    "Content-Type": "application/json",
+  };
+  const res = await fetch("/v1/node/config", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(pricing),
+  });
+  if (!res.ok) {
+    throw new Error(`Update pricing failed: ${res.status}`);
   }
   return res.json();
 }

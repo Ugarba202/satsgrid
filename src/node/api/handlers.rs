@@ -12,8 +12,27 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub async fn health_check() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "service": "satsgrid-node" }))
+pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let backend_str = match state.config.lightning.backend {
+        crate::config::schema::LightningBackendType::Mock => "mock",
+        crate::config::schema::LightningBackendType::Lnd => "lnd_rest",
+        crate::config::schema::LightningBackendType::Nwc => "nwc",
+    };
+    let network_str = match state.config.lightning.network {
+        crate::config::schema::BitcoinNetwork::Mainnet => "mainnet",
+        crate::config::schema::BitcoinNetwork::Testnet => "testnet",
+        crate::config::schema::BitcoinNetwork::Regtest => "regtest",
+        crate::config::schema::BitcoinNetwork::Signet => "signet",
+    };
+
+    Json(json!({
+        "status": "ok",
+        "service": "satsgrid-node",
+        "lightning": {
+            "backend": backend_str,
+            "network": network_str,
+        }
+    }))
 }
 
 pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
