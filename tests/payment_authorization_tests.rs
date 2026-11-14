@@ -224,7 +224,9 @@ async fn test_e2e_replay_rejected_in_chat_completions() {
     let root_key = b"01234567890123456789012345678901".to_vec();
     let macaroon_service = Arc::new(MacaroonService::new(root_key, "satsgrid-node"));
 
-    let config = satsgrid::config::schema::NodeConfig::default();
+    let mut config = satsgrid::config::schema::NodeConfig::default();
+    config.server.host = "127.0.0.1".to_string();
+    config.lightning.allow_mock = true;
     let proxy = OpenAiProxy::new("http://127.0.0.1:11434");
 
     let state = AppState {

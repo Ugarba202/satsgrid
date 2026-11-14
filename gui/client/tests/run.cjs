@@ -10,3 +10,8 @@ const jiti = createJiti(root, {
 
 jiti("./tests/l402.test.ts");
 jiti("./tests/session_closure.test.ts");
+jiti("./tests/session_lifecycle.test.ts");
+jiti("./tests/inference_session.test.ts");
+jiti("./tests/session_read.test.ts");
+jiti("./tests/lightning_invoice.test.ts");
+jiti("./tests/exhausted_session_recovery.test.ts");

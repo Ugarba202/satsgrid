@@ -809,7 +809,9 @@ async fn test_existing_session_api_regression() {
     ));
     let budget_manager = Arc::new(SessionBudgetManager::with_store(db.session_store()));
 
-    let config = satsgrid::config::schema::NodeConfig::default();
+    let mut config = satsgrid::config::schema::NodeConfig::default();
+    config.server.host = "127.0.0.1".to_string();
+    config.lightning.allow_mock = true;
     let proxy = OpenAiProxy::new("http://127.0.0.1:11434");
 
     let state = AppState {

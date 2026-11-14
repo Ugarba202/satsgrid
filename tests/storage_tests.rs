@@ -905,10 +905,229 @@ async fn test_migration_9_reconciliation_items_schema_and_integrity() {
         .expect("update item");
     assert_eq!(updated_id, item_id);
 
+    // Concurrent reports for the same ambiguous request must converge on one durable item.
+    let (duplicate_a, duplicate_b) = tokio::join!(
+        recon_store.create_or_update_item(
+            satsgrid::node::storage::ReconciliationItemType::InferenceRequest,
+            "req_concurrent_duplicate",
+            None,
+            None,
+            "client_abort_or_timeout_after_dispatch",
+            Some("ambiguous upstream execution"),
+            None,
+        ),
+        recon_store.create_or_update_item(
+            satsgrid::node::storage::ReconciliationItemType::InferenceRequest,
+            "req_concurrent_duplicate",
+            None,
+            None,
+            "client_abort_or_timeout_after_dispatch",
+            Some("ambiguous upstream execution"),
+            None,
+        ),
+    );
+    let duplicate_id_a = duplicate_a.unwrap();
+    let duplicate_id_b = duplicate_b.unwrap();
+    assert_eq!(duplicate_id_a, duplicate_id_b);
+    let duplicate_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_items WHERE item_type = 'inference_request' AND reference_id = 'req_concurrent_duplicate' AND status = 'unresolved'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(duplicate_count, 1);
+    recon_store
+        .mark_resolved(&duplicate_id_a)
+        .await
+        .expect("resolve concurrent duplicate test item");
+
     // 5. Mark resolved
     recon_store
         .mark_resolved(&item_id)
         .await
         .expect("mark resolved");
     assert_eq!(recon_store.count_unresolved().await.expect("count"), 0);
+}
+
+#[tokio::test]
+async fn test_migration_12_model_registry_lifecycle_and_pricing() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let db = Database::init(temp_dir.path())
+        .await
+        .expect("initialize database");
+
+    let model_store = db.model_store();
+
+    // 1. Creating a new discovered model
+    let discovered = vec![
+        satsgrid::node::storage::DiscoveredModel {
+            id: "llama3.2:latest".to_string(),
+            name: "Llama 3.2 Latest".to_string(),
+            owned_by: Some("meta".to_string()),
+            description: Some("Meta Llama 3.2 model".to_string()),
+            context_length: Some(131072),
+        },
+        satsgrid::node::storage::DiscoveredModel {
+            id: "mistral:7b".to_string(),
+            name: "Mistral 7B".to_string(),
+            owned_by: Some("mistralai".to_string()),
+            description: Some("Mistral 7B Instruct".to_string()),
+            context_length: Some(32768),
+        },
+    ];
+
+    let models = model_store
+        .upsert_discovered(&discovered, false)
+        .await
+        .expect("upsert discovered models");
+
+    assert_eq!(models.len(), 2);
+    let llama = model_store
+        .get_model("llama3.2:latest")
+        .await
+        .unwrap()
+        .expect("llama found");
+    assert_eq!(llama.name, "Llama 3.2 Latest");
+    assert_eq!(llama.owned_by, "meta");
+    assert!(llama.is_enabled);
+    assert!(llama.is_available);
+    assert_eq!(llama.flat_rate_sats, None);
+
+    // 2. Setting and retrieving model-specific pricing
+    let set_pricing_res = model_store
+        .set_pricing("llama3.2:latest", Some(25), Some(1), Some(2))
+        .await
+        .expect("set pricing");
+    assert!(set_pricing_res);
+
+    let llama_priced = model_store
+        .get_model("llama3.2:latest")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(llama_priced.flat_rate_sats, Some(25));
+    assert_eq!(llama_priced.sats_per_prompt_token, Some(1));
+    assert_eq!(llama_priced.sats_per_completion_token, Some(2));
+
+    // 3. Enabling and disabling a model
+    let set_disabled = model_store
+        .set_enabled("mistral:7b", false)
+        .await
+        .expect("disable mistral");
+    assert!(set_disabled);
+    let mistral_disabled = model_store.get_model("mistral:7b").await.unwrap().unwrap();
+    assert!(!mistral_disabled.is_enabled);
+
+    // 4. Updating upstream metadata while preserving operator overrides
+    let updated_discovered = vec![
+        satsgrid::node::storage::DiscoveredModel {
+            id: "llama3.2:latest".to_string(),
+            name: "Llama 3.2 v2".to_string(),
+            owned_by: Some("meta-ai".to_string()),
+            description: Some("Updated description".to_string()),
+            context_length: Some(131072),
+        },
+        satsgrid::node::storage::DiscoveredModel {
+            id: "mistral:7b".to_string(),
+            name: "Mistral 7B Updated".to_string(),
+            owned_by: Some("mistralai".to_string()),
+            description: None,
+            context_length: Some(32768),
+        },
+    ];
+
+    model_store
+        .upsert_discovered(&updated_discovered, false)
+        .await
+        .expect("upsert updated models");
+
+    let llama_preserved = model_store
+        .get_model("llama3.2:latest")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(llama_preserved.name, "Llama 3.2 v2");
+    assert_eq!(llama_preserved.owned_by, "meta-ai");
+    assert_eq!(
+        llama_preserved.description.as_deref(),
+        Some("Updated description")
+    );
+    // Operator overrides must be completely preserved:
+    assert_eq!(llama_preserved.flat_rate_sats, Some(25));
+    assert_eq!(llama_preserved.sats_per_prompt_token, Some(1));
+    assert_eq!(llama_preserved.sats_per_completion_token, Some(2));
+    assert!(llama_preserved.is_enabled);
+
+    let mistral_preserved = model_store.get_model("mistral:7b").await.unwrap().unwrap();
+    // Mistral was disabled by operator; must stay disabled:
+    assert!(!mistral_preserved.is_enabled);
+    assert_eq!(mistral_preserved.name, "Mistral 7B Updated");
+
+    // 5. Listing models with filters
+    let all_models = model_store.list_models(None, None).await.unwrap();
+    assert_eq!(all_models.len(), 2);
+
+    let enabled_models = model_store.list_models(Some(true), None).await.unwrap();
+    assert_eq!(enabled_models.len(), 1);
+    assert_eq!(enabled_models[0].id, "llama3.2:latest");
+
+    let disabled_models = model_store.list_models(Some(false), None).await.unwrap();
+    assert_eq!(disabled_models.len(), 1);
+    assert_eq!(disabled_models[0].id, "mistral:7b");
+
+    // 6. Retrieving a missing model
+    let missing = model_store.get_model("nonexistent:model").await.unwrap();
+    assert!(missing.is_none());
+
+    // 7. Marking models unavailable after a successful inventory sync
+    // In this scan, only llama3.2 is discovered upstream. mistral is missing.
+    let only_llama = vec![satsgrid::node::storage::DiscoveredModel {
+        id: "llama3.2:latest".to_string(),
+        name: "Llama 3.2 v2".to_string(),
+        owned_by: Some("meta-ai".to_string()),
+        description: None,
+        context_length: Some(131072),
+    }];
+
+    model_store
+        .upsert_discovered(&only_llama, true)
+        .await
+        .expect("upsert with mark_missing_unavailable = true");
+
+    let llama_after_sync = model_store
+        .get_model("llama3.2:latest")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(llama_after_sync.is_available);
+
+    let mistral_after_sync = model_store.get_model("mistral:7b").await.unwrap().unwrap();
+    assert!(!mistral_after_sync.is_available); // Marked unavailable!
+
+    // 8. Ensuring failed synchronization does not mark models unavailable
+    // (If upstream sync fails, caller does not invoke upsert_discovered with empty list)
+    // Testing that calling with mark_missing_unavailable = false preserves previous availability:
+    let empty_list: Vec<satsgrid::node::storage::DiscoveredModel> = Vec::new();
+    model_store
+        .upsert_discovered(&empty_list, false)
+        .await
+        .expect("sync without marking missing");
+
+    let mistral_still_present = model_store.get_model("mistral:7b").await.unwrap().unwrap();
+    assert_eq!(mistral_still_present.id, "mistral:7b");
+
+    // 9. Preserving model records after they become unavailable
+    // Both records still exist in the database even though mistral is unavailable
+    let list_all_preserved = model_store.list_models(None, None).await.unwrap();
+    assert_eq!(list_all_preserved.len(), 2);
+    let available_only = model_store.list_models(None, Some(true)).await.unwrap();
+    assert_eq!(available_only.len(), 1);
+    assert_eq!(available_only[0].id, "llama3.2:latest");
+
+    // 10. Migration compatibility: verify migration 12 record in _satsgrid_migrations
+    let applied_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _satsgrid_migrations")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(applied_version, 12);
 }

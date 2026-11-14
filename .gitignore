@@ -27,6 +27,7 @@ Thumbs.db
 
 # SatsGrid runtime state and secrets
 .satsgrid/
+.satsgrid*/
 .satsgrid_macaroon_key
 .satsgrid_admin_token
 

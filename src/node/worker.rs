@@ -1,8 +1,9 @@
 use crate::common::error::Result;
-use crate::node::lightning::LightningBackend;
+use crate::node::lightning::{LightningBackend, SettlementOutcome};
 use crate::node::storage::reconciliation::{ReconciliationItemType, ReconciliationStore};
 use crate::node::storage::session::SessionStore;
 use crate::node::storage::Database;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -69,6 +70,7 @@ impl ReconciliationWorker {
         let invoice_store = self.db.invoice_store();
         let session_store = self.db.session_store();
         let recon_store = self.db.reconciliation_store();
+        let mut checked_outcomes = HashMap::<String, SettlementOutcome>::new();
 
         // 1. Fetch bounded batch of pending invoices
         let pending_invoices = invoice_store
@@ -76,54 +78,129 @@ impl ReconciliationWorker {
             .await?;
 
         for inv in pending_invoices {
-            // Check expiry first if not settled
-            if now >= inv.expires_at {
-                // Before marking expired, verify authoritative backend settlement status
-                match self.lightning.is_invoice_settled(&inv.payment_hash).await {
-                    Ok(true) => {
-                        self.handle_settled_invoice(
-                            &inv,
-                            &invoice_store,
-                            &session_store,
-                            &recon_store,
-                        )
-                        .await?;
+            if recon_store
+                .invoice_retry_is_scheduled_after(&inv.payment_hash, now)
+                .await?
+            {
+                continue;
+            }
+
+            let mut stats = self.stats.write().await;
+            stats.invoices_checked += 1;
+            drop(stats);
+
+            // Query authoritative, typed settlement outcome from the backend
+            let outcome = match self.lightning.check_settlement(&inv.payment_hash).await {
+                Ok(out) => out,
+                Err(e) => SettlementOutcome::BackendUnavailable {
+                    error: e.to_string(),
+                },
+            };
+            checked_outcomes.insert(inv.payment_hash.0.clone(), outcome.clone());
+
+            match outcome {
+                SettlementOutcome::ConfirmedSettled {
+                    preimage,
+                    settled_at,
+                    amount_sats,
+                } => {
+                    let _ = (preimage, amount_sats);
+                    self.handle_settled_invoice_with_ts(
+                        &inv,
+                        settled_at,
+                        &invoice_store,
+                        &session_store,
+                        &recon_store,
+                    )
+                    .await?;
+                }
+                SettlementOutcome::ConfirmedExpired { .. } => {
+                    if invoice_store.mark_expired(&inv.payment_hash).await? {
+                        let mut stats = self.stats.write().await;
+                        stats.invoices_expired += 1;
                     }
-                    Ok(false) => {
-                        if invoice_store.mark_expired(&inv.payment_hash).await? {
+                }
+                SettlementOutcome::ConfirmedCancelled { .. } => {
+                    let _ = invoice_store.mark_cancelled(&inv.payment_hash).await;
+                }
+                SettlementOutcome::ConfirmedPending {
+                    expires_at: backend_expires_at,
+                } => {
+                    // Check if both local and backend agree it is expired
+                    if now >= inv.expires_at {
+                        let is_backend_expired =
+                            backend_expires_at.map(|exp| now >= exp).unwrap_or(true);
+                        if is_backend_expired
+                            && invoice_store.mark_expired(&inv.payment_hash).await?
+                        {
                             let mut stats = self.stats.write().await;
                             stats.invoices_expired += 1;
                         }
                     }
-                    Err(e) => {
-                        // Transient backend error: do NOT mark expired; record retry item
-                        tracing::warn!(
-                            payment_hash = %inv.payment_hash.0,
-                            "Failed to query backend settlement for expiring invoice: {}", e
-                        );
-                        let mut stats = self.stats.write().await;
-                        stats.last_error = Some(e.to_string());
-                    }
+                    // Otherwise still pending/open, no action
                 }
-                continue;
-            }
-
-            // Normal pending invoice check
-            match self.lightning.is_invoice_settled(&inv.payment_hash).await {
-                Ok(true) => {
-                    self.handle_settled_invoice(&inv, &invoice_store, &session_store, &recon_store)
-                        .await?;
-                }
-                Ok(false) => {
-                    // Still open and within expiry: no action needed
-                }
-                Err(e) => {
-                    tracing::debug!(
+                SettlementOutcome::BackendUnavailable { error } => {
+                    // CRITICAL: NEVER mark expired or cancelled on backend unavailability
+                    tracing::warn!(
                         payment_hash = %inv.payment_hash.0,
-                        "Backend lookup failed for pending invoice: {}", e
+                        "Settlement backend unavailable for invoice: {}",
+                        error
                     );
                     let mut stats = self.stats.write().await;
-                    stats.last_error = Some(e.to_string());
+                    stats.last_error = Some(error);
+                }
+                SettlementOutcome::Unknown { details } => {
+                    tracing::debug!(
+                        payment_hash = %inv.payment_hash.0,
+                        "Invoice lookup returned unknown/not found: {}",
+                        details
+                    );
+                    // An unknown lookup is not authoritative expiry evidence. Keep the
+                    // invoice pending and durably retry reconciliation with backoff.
+                    let item_id = recon_store
+                        .create_or_update_item(
+                            ReconciliationItemType::Invoice,
+                            &inv.payment_hash.0,
+                            Some(&inv.payment_hash),
+                            inv.session_id.as_ref(),
+                            "invoice_lookup_unknown",
+                            Some(&details),
+                            None,
+                        )
+                        .await?;
+                    let item = recon_store.get_item(&item_id).await?.ok_or_else(|| {
+                        crate::common::error::Error::Internal(format!(
+                            "Reconciliation item '{}' disappeared after creation",
+                            item_id
+                        ))
+                    })?;
+                    let attempts = (item.attempt_count + 1).min(6);
+                    let backoff_secs = (30 * (1_i64 << attempts)).min(3600);
+                    recon_store
+                        .record_retry_attempt(
+                            &item_id,
+                            &format!("Unknown invoice in backend: {}", details),
+                            now + backoff_secs,
+                        )
+                        .await?;
+                }
+                SettlementOutcome::InvalidOrConflictingEvidence { details } => {
+                    tracing::warn!(
+                        payment_hash = %inv.payment_hash.0,
+                        "Conflicting or invalid settlement evidence received: {}",
+                        details
+                    );
+                    let _ = recon_store
+                        .create_or_update_item(
+                            ReconciliationItemType::Invoice,
+                            &inv.payment_hash.0,
+                            Some(&inv.payment_hash),
+                            inv.session_id.as_ref(),
+                            "conflicting_settlement_evidence",
+                            Some(&details),
+                            None,
+                        )
+                        .await;
                 }
             }
         }
@@ -140,27 +217,72 @@ impl ReconciliationWorker {
             }
 
             if let Some(ref hash) = item.payment_hash {
-                match self.lightning.is_invoice_settled(hash).await {
-                    Ok(true) => {
-                        let _ = invoice_store.mark_settled(hash, now).await;
+                let lookup = match checked_outcomes.get(&hash.0) {
+                    Some(outcome) => Ok(outcome.clone()),
+                    None => self.lightning.check_settlement(hash).await,
+                };
+                match lookup {
+                    Ok(SettlementOutcome::ConfirmedSettled { settled_at, .. }) => {
+                        let _ = invoice_store.mark_settled(hash, settled_at).await;
                         let _ = recon_store.mark_resolved(&item.id).await;
                         let mut stats = self.stats.write().await;
                         stats.items_reconciled += 1;
                     }
-                    Ok(false) => {
+                    Ok(SettlementOutcome::ConfirmedExpired { .. }) => {
+                        let _ = invoice_store.mark_expired(hash).await;
+                        let _ = recon_store.mark_resolved(&item.id).await;
+                    }
+                    Ok(SettlementOutcome::ConfirmedCancelled { .. }) => {
+                        let _ = invoice_store.mark_cancelled(hash).await;
+                        let _ = recon_store.mark_resolved(&item.id).await;
+                    }
+                    Ok(SettlementOutcome::ConfirmedPending { .. }) => {
                         // Reschedule with backoff
                         let attempts = item.attempt_count + 1;
                         let backoff_secs = (30 * (1 << attempts.min(6))).min(3600);
                         let next_retry = now + backoff_secs;
+                        recon_store
+                            .record_retry_attempt(
+                                &item.id,
+                                "Backend confirmed still pending",
+                                next_retry,
+                            )
+                            .await?;
+                    }
+                    Ok(SettlementOutcome::BackendUnavailable { error }) => {
+                        let attempts = item.attempt_count + 1;
+                        let backoff_secs = (30 * (1 << attempts.min(6))).min(3600);
+                        let next_retry = now + backoff_secs;
+                        recon_store
+                            .record_retry_attempt(
+                                &item.id,
+                                &format!("Backend unavailable: {}", error),
+                                next_retry,
+                            )
+                            .await?;
+                    }
+                    Ok(SettlementOutcome::Unknown { details }) => {
+                        let attempts = item.attempt_count + 1;
+                        let backoff_secs = (30 * (1 << attempts.min(6))).min(3600);
+                        let next_retry = now + backoff_secs;
+                        recon_store
+                            .record_retry_attempt(
+                                &item.id,
+                                &format!("Unknown invoice in backend: {}", details),
+                                next_retry,
+                            )
+                            .await?;
+                    }
+                    Ok(SettlementOutcome::InvalidOrConflictingEvidence { details }) => {
                         let _ = recon_store
                             .create_or_update_item(
                                 item.item_type,
                                 &item.reference_id,
                                 item.payment_hash.as_ref(),
                                 item.session_id.as_ref(),
-                                &item.reason,
-                                Some("Backend confirmed not yet settled"),
-                                Some(next_retry),
+                                "conflicting_settlement_evidence",
+                                Some(&details),
+                                None,
                             )
                             .await;
                     }
@@ -168,17 +290,13 @@ impl ReconciliationWorker {
                         let attempts = item.attempt_count + 1;
                         let backoff_secs = (30 * (1 << attempts.min(6))).min(3600);
                         let next_retry = now + backoff_secs;
-                        let _ = recon_store
-                            .create_or_update_item(
-                                item.item_type,
-                                &item.reference_id,
-                                item.payment_hash.as_ref(),
-                                item.session_id.as_ref(),
-                                &item.reason,
-                                Some(&format!("Backend lookup error: {}", e)),
-                                Some(next_retry),
+                        recon_store
+                            .record_retry_attempt(
+                                &item.id,
+                                &format!("Backend lookup error: {}", e),
+                                next_retry,
                             )
-                            .await;
+                            .await?;
                     }
                 }
             }
@@ -191,15 +309,17 @@ impl ReconciliationWorker {
         Ok(())
     }
 
-    async fn handle_settled_invoice(
+    async fn handle_settled_invoice_with_ts(
         &self,
         inv: &crate::node::storage::InvoiceRecord,
+        settled_at: i64,
         invoice_store: &crate::node::storage::InvoiceStore,
         session_store: &SessionStore,
         recon_store: &ReconciliationStore,
     ) -> Result<()> {
-        let now = chrono::Utc::now().timestamp();
-        let settle_res = invoice_store.mark_settled(&inv.payment_hash, now).await?;
+        let settle_res = invoice_store
+            .mark_settled(&inv.payment_hash, settled_at)
+            .await?;
 
         if settle_res == crate::node::storage::InvoiceSettlementResult::Settled
             || settle_res == crate::node::storage::InvoiceSettlementResult::AlreadySettled
@@ -246,6 +366,19 @@ impl ReconciliationWorker {
         }
 
         Ok(())
+    }
+
+    #[allow(dead_code)]
+    async fn handle_settled_invoice(
+        &self,
+        inv: &crate::node::storage::InvoiceRecord,
+        invoice_store: &crate::node::storage::InvoiceStore,
+        session_store: &SessionStore,
+        recon_store: &ReconciliationStore,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.handle_settled_invoice_with_ts(inv, now, invoice_store, session_store, recon_store)
+            .await
     }
 
     /// Spawn the reconciliation worker background loop.

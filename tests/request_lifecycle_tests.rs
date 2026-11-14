@@ -762,7 +762,10 @@ async fn test_sse_early_disconnect_marks_stream_interrupted_not_completed() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: satsgrid::config::schema::LightningConfig {
+            allow_mock: true,
+            ..Default::default()
+        },
         data_dir: dir.path().to_string_lossy().to_string(),
         ..Default::default()
     };
@@ -1009,4 +1012,162 @@ async fn test_precise_idempotency_constraint_vs_primary_key_collision() {
         )
         .await
         .expect("normal insert without idempotency key succeeds");
+}
+
+#[tokio::test]
+async fn test_count_completed_by_session_filtering() {
+    let dir = tempdir().expect("create tempdir");
+    let db = Database::init(dir.path()).await.expect("init db");
+    let store = db.request_store();
+    let session_store = db.session_store();
+    let sid = SessionId(Uuid::new_v4());
+    session_store
+        .create_session(&sid, None, Satoshis(100), 2000000000)
+        .await
+        .unwrap();
+
+    // Initially 0
+    let initial_count = store.count_completed_by_session(&sid).await.unwrap();
+    assert_eq!(initial_count, 0);
+
+    // 1. Reserved request (should not count)
+    store
+        .create_request(
+            "req-res",
+            None,
+            Some(&sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::Streaming,
+            Satoshis(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 0);
+
+    // 2. Processing request (should not count)
+    store.mark_processing("req-res").await.unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 0);
+
+    // 3. Mark completed (should count: 1)
+    store
+        .mark_completed("req-res", Some(10), Some(20))
+        .await
+        .unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 1);
+
+    // 4. Failed request (should not count)
+    store
+        .create_request(
+            "req-fail",
+            None,
+            Some(&sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::Streaming,
+            Satoshis(10),
+        )
+        .await
+        .unwrap();
+    store.mark_processing("req-fail").await.unwrap();
+    store
+        .mark_failed("req-fail", "some_error", "upstream")
+        .await
+        .unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 1);
+
+    // 5. Stream interrupted request (should not count)
+    store
+        .create_request(
+            "req-int",
+            None,
+            Some(&sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::Streaming,
+            Satoshis(10),
+        )
+        .await
+        .unwrap();
+    store.mark_processing("req-int").await.unwrap();
+    store
+        .mark_stream_interrupted("req-int", "interrupted_stream", Some(5))
+        .await
+        .unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 1);
+
+    // 6. Reconciliation required request (should not count)
+    store
+        .create_request(
+            "req-rec",
+            None,
+            Some(&sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::Streaming,
+            Satoshis(10),
+        )
+        .await
+        .unwrap();
+    store.mark_processing("req-rec").await.unwrap();
+    store
+        .mark_reconciliation_required("req-rec", "unresolved")
+        .await
+        .unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 1);
+
+    // 7. Another completed request (should count: 2)
+    store
+        .create_request(
+            "req-comp-2",
+            None,
+            Some(&sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::NonStreaming,
+            Satoshis(10),
+        )
+        .await
+        .unwrap();
+    store.mark_processing("req-comp-2").await.unwrap();
+    store
+        .mark_completed("req-comp-2", Some(15), Some(30))
+        .await
+        .unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 2);
+
+    // Request on a different session does not count towards this session
+    let other_sid = SessionId(Uuid::new_v4());
+    session_store
+        .create_session(&other_sid, None, Satoshis(100), 2000000000)
+        .await
+        .unwrap();
+    store
+        .create_request(
+            "req-other",
+            None,
+            Some(&other_sid),
+            None,
+            None,
+            "llama3.2",
+            RequestMode::Streaming,
+            Satoshis(10),
+        )
+        .await
+        .unwrap();
+    store.mark_processing("req-other").await.unwrap();
+    store
+        .mark_completed("req-other", Some(10), Some(20))
+        .await
+        .unwrap();
+    assert_eq!(store.count_completed_by_session(&sid).await.unwrap(), 2);
+    assert_eq!(
+        store.count_completed_by_session(&other_sid).await.unwrap(),
+        1
+    );
 }

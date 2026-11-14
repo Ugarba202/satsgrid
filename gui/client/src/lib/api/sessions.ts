@@ -16,6 +16,53 @@ export interface CloseSessionResult {
   reason?: string;
 }
 
+export interface SessionSnapshot {
+  session_id: string;
+  status: "pending_payment" | "active" | "exhausted" | "expired" | "closed";
+  total_budget_sats: number;
+  remaining_sats: number;
+  reserved_sats: number;
+  spent_sats: number;
+  requests_count?: number;
+  created_at: number;
+  expires_at: number;
+  closed_at?: number | null;
+}
+
+export class SessionReadError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message);
+    this.name = "SessionReadError";
+  }
+}
+
+export async function getSession(
+  sessionId: string,
+  credentials: { macaroon: string; preimage: string }
+): Promise<SessionSnapshot> {
+  const response = await fetch(`/v1/session/${encodeURIComponent(sessionId)}`, {
+    cache: "no-store",
+    headers: {
+      Authorization: `L402 ${credentials.macaroon}:${credentials.preimage}`,
+    },
+  });
+  if (!response.ok) {
+    let message = response.statusText || "Session synchronization failed";
+    try {
+      const body = await response.json();
+      const candidate = body?.error?.message ?? body?.error ?? body?.message;
+      if (typeof candidate === "string" && candidate.trim()) message = candidate;
+    } catch {
+      // Preserve the HTTP status when the error body is not JSON.
+    }
+    for (const secret of [credentials.macaroon, credentials.preimage]) {
+      if (secret) message = message.replaceAll(secret, "[redacted]");
+    }
+    throw new SessionReadError(`Session synchronization failed (HTTP ${response.status}): ${message}`, response.status);
+  }
+  return response.json();
+}
+
 export async function createSession(budgetSats: number) {
   return fetchWithL402("/v1/session/new", {
     method: "POST",
@@ -64,4 +111,3 @@ export async function closeSession(
 
   return res.json();
 }
-

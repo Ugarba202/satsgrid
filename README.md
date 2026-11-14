@@ -135,6 +135,19 @@ When running against the `mock` backend, the CLI client automatically settles th
 
 ---
 
+## Developer API & Integration Quickstart
+
+For developers integrating applications, autonomous agents, or services using cURL, Python, or Node.js, read our comprehensive [Developer API Quickstart Guide](docs/quickstart.md).
+
+It covers:
+- HTTP 402 challenge parsing and BOLT11 invoice payment flows.
+- Multi-turn Session Budgets and Pay-Per-Request authorization.
+- Working examples in cURL, Python (`httpx`), and Node.js (`fetch`).
+- Streaming completions via Server-Sent Events (SSE).
+- Cryptographic receipt verification and security best practices.
+
+---
+
 ## Docker Deployment
 
 To launch SatsGrid alongside an Ollama instance in a single Docker Compose stack:

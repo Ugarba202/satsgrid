@@ -1,7 +1,7 @@
 use crate::common::error::{Error, Result};
 use crate::common::types::{PaymentHash, Satoshis};
 use crate::config::schema::LightningConfig;
-use crate::node::lightning::backend::LightningBackend;
+use crate::node::lightning::backend::{LightningBackend, SettlementOutcome};
 use crate::node::lightning::invoice::Invoice;
 use async_trait::async_trait;
 use base64::Engine;
@@ -62,15 +62,22 @@ impl LndBackend {
                     cert_path, e
                 ))
             })?;
-            if let Ok(cert) = reqwest::Certificate::from_pem(&cert_bytes) {
+            let certs = reqwest::Certificate::from_pem_bundle(&cert_bytes).map_err(|e| {
+                Error::Config(format!(
+                    "Failed to parse LND tls.cert as PEM from {}: {}",
+                    cert_path, e
+                ))
+            })?;
+            if certs.is_empty() {
+                return Err(Error::Config(format!(
+                    "Failed to parse LND tls.cert as PEM from {}: no valid certificates found in PEM file",
+                    cert_path
+                )));
+            }
+            for cert in certs {
                 client_builder = client_builder.add_root_certificate(cert);
             }
         }
-
-        // Allow self-signed certificates and loopback hostname variations for local and Polar nodes
-        client_builder = client_builder
-            .danger_accept_invalid_certs(true)
-            .danger_accept_invalid_hostnames(true);
 
         let client = client_builder
             .build()
@@ -180,40 +187,129 @@ impl LightningBackend for LndBackend {
     }
 
     async fn is_invoice_settled(&self, payment_hash: &PaymentHash) -> Result<bool> {
+        match self.check_settlement(payment_hash).await? {
+            SettlementOutcome::ConfirmedSettled { .. } => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    async fn check_settlement(&self, payment_hash: &PaymentHash) -> Result<SettlementOutcome> {
         let url = format!("{}/v1/invoice/{}", self.rest_url, payment_hash.0);
 
-        let resp = self
+        let resp = match self
             .client
             .get(&url)
             .headers(self.auth_headers())
             .send()
             .await
-            .map_err(|e| Error::Lightning(format!("LND connection error: {}", e)))?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Ok(SettlementOutcome::BackendUnavailable {
+                    error: format!("LND connection error: {}", e),
+                });
+            }
+        };
 
-        if resp.status().as_u16() == 404 {
-            return Ok(false);
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            return Ok(SettlementOutcome::Unknown {
+                details: format!("Invoice '{}' not found on LND node", payment_hash.0),
+            });
         }
 
-        if !resp.status().is_success() {
+        if status.is_server_error() {
             let err_text = resp.text().await.unwrap_or_default();
-            return Err(Error::Lightning(format!(
-                "LND error checking invoice: {}",
-                err_text
-            )));
+            return Ok(SettlementOutcome::BackendUnavailable {
+                error: format!("LND 5xx server error: {}", err_text),
+            });
         }
 
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| Error::Lightning(format!("Failed to parse LND invoice status: {}", e)))?;
+        if !status.is_success() {
+            let err_text = resp.text().await.unwrap_or_default();
+            return Ok(SettlementOutcome::InvalidOrConflictingEvidence {
+                details: format!("LND returned HTTP {}: {}", status, err_text),
+            });
+        }
 
-        let is_settled = body["settled"].as_bool().unwrap_or(false)
-            || body["state"]
+        let body: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(SettlementOutcome::InvalidOrConflictingEvidence {
+                    details: format!("Failed to parse LND invoice JSON: {}", e),
+                });
+            }
+        };
+
+        let state_str = body["state"].as_str().unwrap_or("");
+        let is_settled = body["settled"].as_bool().unwrap_or(false) || state_str == "SETTLED";
+
+        if is_settled {
+            let settle_date = body["settle_date"]
                 .as_str()
-                .map(|s| s == "SETTLED")
-                .unwrap_or(false);
+                .and_then(|s| s.parse::<i64>().ok())
+                .or_else(|| body["settle_date"].as_i64())
+                .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-        Ok(is_settled)
+            let amount_sats = body["value"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+                .or_else(|| body["value"].as_u64());
+
+            let preimage = body["r_preimage"].as_str().and_then(|p| {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(p) {
+                    if bytes.len() == 32 {
+                        return Some(hex::encode(bytes));
+                    }
+                }
+                if p.len() == 64 {
+                    Some(p.to_string())
+                } else {
+                    None
+                }
+            });
+
+            return Ok(SettlementOutcome::ConfirmedSettled {
+                preimage,
+                settled_at: settle_date,
+                amount_sats,
+            });
+        }
+
+        if state_str == "CANCELED" {
+            let now = chrono::Utc::now().timestamp();
+            return Ok(SettlementOutcome::ConfirmedCancelled { cancelled_at: now });
+        }
+
+        // Check expiration
+        let creation_date = body["creation_date"]
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| body["creation_date"].as_i64())
+            .unwrap_or(0);
+
+        let expiry_secs = body["expiry"]
+            .as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| body["expiry"].as_i64())
+            .unwrap_or(3600);
+
+        let expires_at = creation_date + expiry_secs;
+        let now = chrono::Utc::now().timestamp();
+
+        if creation_date > 0 && now >= expires_at {
+            Ok(SettlementOutcome::ConfirmedExpired {
+                expired_at: expires_at,
+            })
+        } else {
+            Ok(SettlementOutcome::ConfirmedPending {
+                expires_at: if creation_date > 0 {
+                    Some(expires_at)
+                } else {
+                    None
+                },
+            })
+        }
     }
 
     async fn pay_invoice(&self, invoice: &str) -> Result<String> {

@@ -3,7 +3,9 @@ use axum::{
     http::{header, Request, StatusCode},
 };
 use satsgrid::common::types::{Satoshis, SessionId};
-use satsgrid::config::schema::{NodeConfig, PricingConfig, ServerConfig, UpstreamConfig};
+use satsgrid::config::schema::{
+    LightningConfig, NodeConfig, PricingConfig, ServerConfig, UpstreamConfig,
+};
 use satsgrid::node::api::routes::create_routes;
 use satsgrid::node::api::AppState;
 use satsgrid::node::gate::{Caveat, MacaroonService, SessionBudgetManager};
@@ -57,6 +59,10 @@ async fn setup_test_context(max_bytes: usize, max_completion_tokens: usize) -> T
             admin_token: Some("test-admin-token".to_string()),
             max_request_body_bytes: max_bytes,
             max_completion_tokens_limit: max_completion_tokens,
+        },
+        lightning: LightningConfig {
+            allow_mock: true,
+            ..Default::default()
         },
         pricing: PricingConfig::new(Satoshis(10)),
         upstream: UpstreamConfig {

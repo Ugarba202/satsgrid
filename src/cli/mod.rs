@@ -2,6 +2,7 @@ pub mod call;
 pub mod discover;
 pub mod node;
 pub mod process;
+pub mod receipt;
 
 use clap::{Parser, Subcommand};
 
@@ -24,4 +25,6 @@ pub enum Commands {
     Call(call::CallArgs),
     /// Discover active SatsGrid nodes announced on Nostr relays
     Discover(discover::DiscoverArgs),
+    /// Cryptographic receipt verification
+    Receipt(receipt::ReceiptArgs),
 }

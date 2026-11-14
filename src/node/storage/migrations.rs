@@ -271,6 +271,63 @@ pub const MIGRATIONS: &[Migration] = &[
         "#,
         requires_foreign_keys_disabled: false,
     },
+    Migration {
+        version: 10,
+        name: "payguard_signed_receipts",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS receipts (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL REFERENCES inference_requests(id) ON DELETE RESTRICT,
+            receipt_version INTEGER NOT NULL DEFAULT 1,
+            signing_key_id TEXT NOT NULL,
+            signature_algorithm TEXT NOT NULL,
+            public_key_hex TEXT NOT NULL,
+            canonical_payload TEXT NOT NULL,
+            signature_hex TEXT NOT NULL,
+            inference_status TEXT NOT NULL,
+            payment_status TEXT NOT NULL,
+            charged_sats INTEGER NOT NULL,
+            supersedes_receipt_id TEXT REFERENCES receipts(id) ON DELETE SET NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_receipts_request_id ON receipts(request_id);
+        CREATE INDEX IF NOT EXISTS idx_receipts_created_at ON receipts(created_at);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 11,
+        name: "one_signed_receipt_per_request",
+        sql: r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_unique_request_id ON receipts(request_id);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 12,
+        name: "create_model_registry",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS models (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            owned_by TEXT NOT NULL DEFAULT 'satsgrid-node',
+            description TEXT,
+            context_length INTEGER,
+            flat_rate_sats INTEGER CHECK (flat_rate_sats IS NULL OR flat_rate_sats >= 0),
+            sats_per_prompt_token INTEGER CHECK (sats_per_prompt_token IS NULL OR sats_per_prompt_token >= 0),
+            sats_per_completion_token INTEGER CHECK (sats_per_completion_token IS NULL OR sats_per_completion_token >= 0),
+            is_enabled BOOLEAN NOT NULL DEFAULT 1,
+            is_available BOOLEAN NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_models_is_enabled ON models(is_enabled);
+        CREATE INDEX IF NOT EXISTS idx_models_is_available ON models(is_available);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
 ];
 
 /// Execute pending migrations against the SQLite pool in an atomic transaction.

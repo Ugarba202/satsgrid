@@ -1,7 +1,9 @@
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
 use satsgrid::common::types::{Satoshis, SessionId};
-use satsgrid::config::schema::{ConcurrencyConfig, NodeConfig, PricingConfig, UpstreamConfig};
+use satsgrid::config::schema::{
+    ConcurrencyConfig, LightningConfig, NodeConfig, PricingConfig, ServerConfig, UpstreamConfig,
+};
 use satsgrid::node::api::routes::create_routes;
 use satsgrid::node::api::AppState;
 use satsgrid::node::concurrency::ConcurrencyManager;
@@ -35,6 +37,14 @@ async fn setup_test_context(concurrency_cfg: ConcurrencyConfig) -> TestContext {
     let mock_server = MockServer::start().await;
 
     let config = NodeConfig {
+        server: ServerConfig {
+            host: "127.0.0.1".to_string(),
+            ..Default::default()
+        },
+        lightning: LightningConfig {
+            allow_mock: true,
+            ..Default::default()
+        },
         upstream: UpstreamConfig {
             url: mock_server.uri(),
             connect_timeout_secs: 2,
@@ -543,6 +553,14 @@ async fn test_streaming_active_blocks_concurrent_request() {
     let proxy = OpenAiProxy::new(format!("http://{}", addr));
 
     let test_cfg = NodeConfig {
+        server: ServerConfig {
+            host: "127.0.0.1".to_string(),
+            ..Default::default()
+        },
+        lightning: LightningConfig {
+            allow_mock: true,
+            ..Default::default()
+        },
         upstream: UpstreamConfig {
             url: format!("http://{}", addr),
             connect_timeout_secs: 2,

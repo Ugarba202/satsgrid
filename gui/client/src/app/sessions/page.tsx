@@ -13,12 +13,13 @@ import {
   getStoredSessions, 
   deleteStoredSession, 
   markStoredSessionClosed,
+  saveStoredSession,
   getActiveSessionId, 
   setActiveSessionId, 
   clearActiveSessionId, 
   StoredSession 
 } from "@/lib/storage/sessions";
-import { closeSession } from "@/lib/api/sessions";
+import { closeSession, getSession } from "@/lib/api/sessions";
 
 export default function SessionsPage() {
   const [sessions, setSessions] = useState<StoredSession[]>([]);
@@ -29,9 +30,48 @@ export default function SessionsPage() {
   const [closeError, setCloseError] = useState<string | null>(null);
 
   useEffect(() => {
-    setSessions(getStoredSessions());
+    const initial = getStoredSessions();
+    setSessions(initial);
     setActiveSessionIdState(getActiveSessionId());
     setIsLoaded(true);
+
+    // Synchronize sessions that have credentials with authoritative backend metadata
+    const syncable = initial.filter((s) => s.macaroon && s.preimage);
+    if (syncable.length === 0) return;
+
+    let mounted = true;
+    void (async () => {
+      for (const s of syncable) {
+        try {
+          const snapshot = await getSession(s.id, {
+            macaroon: s.macaroon,
+            preimage: s.preimage!,
+          });
+          if (!mounted) break;
+          const updated: StoredSession = {
+            ...s,
+            status: snapshot.status,
+            budget_sats: snapshot.total_budget_sats,
+            remaining_sats: snapshot.remaining_sats,
+            reserved_sats: snapshot.reserved_sats,
+            spent_sats: snapshot.spent_sats,
+            requests_count: typeof snapshot.requests_count === "number" ? snapshot.requests_count : s.requests_count,
+            expires_at: snapshot.expires_at,
+            closed_at: snapshot.closed_at ?? undefined,
+          };
+          saveStoredSession(updated);
+          setSessions((current) =>
+            current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item))
+          );
+        } catch {
+          // Keep cached session data intact when synchronization fails or network is unavailable
+        }
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   const handleDelete = (id: string) => {

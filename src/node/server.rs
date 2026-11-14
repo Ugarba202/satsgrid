@@ -62,7 +62,13 @@ impl SatsGridServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let addr = format!("{}:{}", self.config.server.host, self.config.server.port);
+        self.config.validate()?;
+        let host = &self.config.server.host;
+        let addr = if host.contains(':') {
+            format!("[{}]:{}", host, self.config.server.port)
+        } else {
+            format!("{}:{}", host, self.config.server.port)
+        };
         tracing::info!("Starting SatsGrid Node on {}", addr);
 
         // Initialize persistent SQLite database in data_dir
@@ -150,6 +156,12 @@ impl SatsGridServer {
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let worker_handle = recon_worker.clone().spawn(shutdown_rx);
         AppState::set_reconciliation_worker(recon_worker);
+
+        let receipt_signer = Arc::new(crate::node::receipt::ReceiptSigner::load_or_generate(
+            &self.config.data_dir,
+            "satsgrid-node",
+        )?);
+        AppState::set_receipt_signer(receipt_signer);
 
         let state = AppState {
             config: Arc::new(self.config.clone()),

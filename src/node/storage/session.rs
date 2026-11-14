@@ -1256,4 +1256,15 @@ impl SessionStore {
 
         Ok(rows)
     }
+
+    /// Count total active sessions currently tracked by the node.
+    pub async fn count_active_sessions(&self) -> Result<u64> {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE status = 'active'")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to count active sessions: {}", e)))?;
+
+        Ok(count.max(0) as u64)
+    }
 }

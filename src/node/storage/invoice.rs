@@ -316,7 +316,7 @@ impl InvoiceStore {
         }
     }
 
-    /// Mark an invoice as expired if it has passed its expiration timestamp.
+    /// Mark an invoice as expired if it has passed its expiration timestamp or confirmed expired by backend.
     pub async fn mark_expired(&self, payment_hash: &PaymentHash) -> Result<bool> {
         let now = chrono::Utc::now().timestamp();
         let query = r#"
@@ -331,6 +331,25 @@ impl InvoiceStore {
             .execute(&self.pool)
             .await
             .map_err(|e| Error::Internal(format!("Failed to mark invoice expired: {}", e)))?;
+
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Mark an invoice as cancelled if confirmed cancelled by the backend.
+    pub async fn mark_cancelled(&self, payment_hash: &PaymentHash) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let query = r#"
+            UPDATE invoices
+            SET status = 'cancelled', updated_at = ?1
+            WHERE payment_hash = ?2 AND status = 'pending'
+        "#;
+
+        let res = sqlx::query(query)
+            .bind(now)
+            .bind(&payment_hash.0)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to mark invoice cancelled: {}", e)))?;
 
         Ok(res.rows_affected() > 0)
     }

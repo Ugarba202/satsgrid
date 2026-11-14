@@ -148,6 +148,8 @@ fn default_session_funding_expiry_secs() -> u64 {
 pub struct LightningConfig {
     pub backend: LightningBackendType,
     #[serde(default)]
+    pub allow_mock: bool,
+    #[serde(default)]
     pub network: BitcoinNetwork,
     #[serde(alias = "lnd_rest_host")]
     pub lnd_rpc_host: Option<String>,
@@ -164,6 +166,7 @@ impl Default for LightningConfig {
     fn default() -> Self {
         Self {
             backend: LightningBackendType::Mock,
+            allow_mock: false,
             network: BitcoinNetwork::Testnet,
             lnd_rpc_host: None,
             lnd_macaroon_path: None,
@@ -332,6 +335,26 @@ impl NodeConfig {
                 "lightning.session_funding_expiry_secs must be between 3600 and 7776000 (90 days)"
                     .to_string(),
             ));
+        }
+        if self.lightning.backend == LightningBackendType::Mock {
+            if !self.lightning.allow_mock {
+                return Err(crate::common::error::Error::Config(
+                    "lightning.backend = 'mock' requires lightning.allow_mock = true".to_string(),
+                ));
+            }
+
+            let is_loopback = self
+                .server
+                .host
+                .parse::<std::net::IpAddr>()
+                .map(|address| address.is_loopback())
+                .unwrap_or(false);
+            if !is_loopback {
+                return Err(crate::common::error::Error::Config(
+                    "lightning.backend = 'mock' requires server.host to be a loopback IP address"
+                        .to_string(),
+                ));
+            }
         }
         Ok(())
     }

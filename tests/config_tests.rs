@@ -2,6 +2,13 @@ use satsgrid::common::types::Satoshis;
 use satsgrid::config::schema::LightningBackendType;
 use satsgrid::config::{ClientConfig, NodeConfig};
 
+fn mock_config(host: &str, allow_mock: bool) -> NodeConfig {
+    let mut config = NodeConfig::default();
+    config.server.host = host.to_string();
+    config.lightning.allow_mock = allow_mock;
+    config
+}
+
 /// Verify that a fully specified structured TOML string correctly
 /// deserializes into typed sub-sections (`[server]`, `[upstream]`, `[pricing]`, `[lightning]`).
 ///
@@ -56,6 +63,7 @@ fn node_config_partial_override_falls_back_to_defaults() {
     assert_eq!(config.server.port, 8080);
     assert_eq!(config.upstream.url, "http://127.0.0.1:11434");
     assert_eq!(config.lightning.backend, LightningBackendType::Mock);
+    assert!(!config.lightning.allow_mock);
 }
 
 /// Test 3: Verify that a client / agent configuration with structured sections
@@ -112,4 +120,40 @@ fn lightning_backend_type_rejects_invalid_variant() {
         result.is_err(),
         "unsupported backend rail must fail to parse"
     );
+}
+
+#[test]
+fn mock_backend_requires_explicit_opt_in() {
+    let config = mock_config("127.0.0.1", false);
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn mock_backend_is_valid_with_opt_in_and_loopback_binding() {
+    let config = mock_config("127.0.0.1", true);
+    config.validate().expect("opted-in loopback mock is valid");
+
+    let ipv6_loopback = mock_config("::1", true);
+    ipv6_loopback
+        .validate()
+        .expect("IPv6 loopback mock is valid");
+}
+
+#[test]
+fn mock_backend_rejects_public_binding() {
+    for host in ["0.0.0.0", "192.168.1.20"] {
+        let config = mock_config(host, true);
+        assert!(config.validate().is_err(), "host {host} must be rejected");
+    }
+}
+
+#[test]
+fn lnd_and_nwc_do_not_require_mock_opt_in() {
+    for backend in [LightningBackendType::Lnd, LightningBackendType::Nwc] {
+        let mut config = mock_config("0.0.0.0", false);
+        config.lightning.backend = backend;
+        config
+            .validate()
+            .expect("non-mock Lightning backend remains valid");
+    }
 }

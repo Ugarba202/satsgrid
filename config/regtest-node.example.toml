@@ -1,0 +1,43 @@
+# ==============================================================================
+# SatsGrid Node Configuration - Regtest LND Mode (Example)
+# ==============================================================================
+
+[server]
+host = "127.0.0.1"
+port = 8080
+# admin_token = "optional-secret-admin-token-for-operator"
+
+[upstream]
+url = "http://127.0.0.1:11434"
+connect_timeout_secs = 10
+response_header_timeout_secs = 60
+stream_idle_timeout_secs = 30
+total_request_timeout_secs = 600
+
+[pricing]
+default_price_sats = 10
+sats_per_prompt_token = 0
+sats_per_completion_token = 0
+
+[lightning]
+# Use real LND backend
+backend = "lnd"
+# Explicit Bitcoin Regtest network
+network = "regtest"
+
+# Provider LND (Bob) REST endpoint
+lnd_rest_host = "https://127.0.0.1:8082"
+
+# Paths to Bob's invoice/admin macaroon and TLS certificate
+# Generated during Regtest / Polar initialization
+lnd_macaroon_path = ".satsgrid/regtest/bob_admin.macaroon"
+lnd_tls_cert_path = ".satsgrid/regtest/bob_tls.cert"
+
+pay_per_request_expiry_secs = 3600
+session_funding_expiry_secs = 2592000
+
+[concurrency]
+max_concurrent_requests = 16
+max_concurrent_per_session = 4
+
+data_dir = ".satsgrid-regtest"

@@ -1,25 +1,28 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { Navbar } from "@/components/layout/navbar";
 import { ChatPanel } from "@/components/playground/chat-panel";
 import { ProtocolPanel } from "@/components/playground/protocol-panel";
 import { SessionStatus, SessionData } from "@/types/session";
-import { createSession } from "@/lib/api/sessions";
+import { createSession, getSession } from "@/lib/api/sessions";
 import { L402Error } from "@/types/api";
 import { streamChatCompletion } from "@/lib/api/inference";
+import { InferenceRequestError } from "@/lib/api/inference";
 import { Message } from "@/types/inference";
+import { attachPaymentProof, inferenceFailureStatus, markBackendConfirmed, recoverySession, restoredStatus, sessionFromChallenge, walletFailureStatus, type RecoveryCredentials } from "@/lib/session-lifecycle";
 import { 
   saveStoredSession, 
   updateStoredSessionBudget, 
   updateStoredSessionMessages,
   getStoredSessionById,
   getStoredSessions,
+  savePendingStoredSession,
   setActiveSessionId,
   getActiveSessionId,
   clearActiveSessionId,
-  StoredSession 
 } from "@/lib/storage/sessions";
+import type { StoredSession } from "@/lib/storage/sessions";
 
 export default function PlaygroundPage() {
   const [sessionStatus, setSessionStatus] = useState<SessionStatus>("idle");
@@ -27,6 +30,49 @@ export default function PlaygroundPage() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [balanceSyncStatus, setBalanceSyncStatus] = useState<"syncing" | "confirmed" | "unavailable">("unavailable");
+
+  const synchronizeSession = useCallback(async (stored: StoredSession) => {
+    if (!stored.preimage || !stored.macaroon) {
+      setBalanceSyncStatus("unavailable");
+      return;
+    }
+    setBalanceSyncStatus("syncing");
+    try {
+      const snapshot = await getSession(stored.id, {
+        macaroon: stored.macaroon,
+        preimage: stored.preimage,
+      });
+      const updated: StoredSession = {
+        ...stored,
+        status: snapshot.status,
+        budget_sats: snapshot.total_budget_sats,
+        remaining_sats: snapshot.remaining_sats,
+        reserved_sats: snapshot.reserved_sats,
+        spent_sats: snapshot.spent_sats,
+        requests_count: typeof snapshot.requests_count === "number" ? snapshot.requests_count : stored.requests_count,
+        expires_at: snapshot.expires_at,
+        closed_at: snapshot.closed_at ?? undefined,
+      };
+      const saved = saveStoredSession(updated);
+      if (getActiveSessionId() !== snapshot.session_id) return;
+      setSessionData((current) => current.id === snapshot.session_id ? {
+        ...current,
+        budget_sats: snapshot.total_budget_sats,
+        remaining_sats: snapshot.remaining_sats,
+        reserved_sats: snapshot.reserved_sats,
+        spent_sats: snapshot.spent_sats,
+        expires_at: snapshot.expires_at,
+        backend_status: snapshot.status,
+      } : current);
+      setSessionStatus(snapshot.status === "pending_payment" ? "payment_submitted" : snapshot.status);
+      setBalanceSyncStatus("confirmed");
+      setErrorMessage(saved ? null : "The backend balance is current, but the local session could not be synchronized.");
+    } catch (error) {
+      setBalanceSyncStatus("unavailable");
+      setErrorMessage(error instanceof Error ? error.message : "Could not synchronize the persisted session balance.");
+    }
+  }, []);
 
   // Restore active or requested session on page mount
   useEffect(() => {
@@ -39,12 +85,17 @@ export default function PlaygroundPage() {
       const stored = getStoredSessionById(targetId);
       if (stored) {
         setActiveSessionId(stored.id);
+        // Restore browser-only session state after hydration to avoid server/client storage access.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSessionData({
           id: stored.id,
           model: stored.model || "llama3.2",
           capability: stored.capability || "inference",
           budget_sats: stored.budget_sats,
           remaining_sats: stored.remaining_sats,
+          reserved_sats: stored.reserved_sats,
+          spent_sats: stored.spent_sats,
+          expires_at: stored.expires_at,
           macaroon: stored.macaroon,
           preimage: stored.preimage,
           invoice: stored.invoice,
@@ -52,13 +103,9 @@ export default function PlaygroundPage() {
         if (stored.messages && stored.messages.length > 0) {
           setMessages(stored.messages);
         }
-        setSessionStatus(
-          stored.status === "active"
-            ? "active"
-            : stored.status === "closed"
-            ? "closed"
-            : "idle"
-        );
+        setSessionStatus(restoredStatus(stored));
+        setBalanceSyncStatus("syncing");
+        void synchronizeSession(stored);
         return;
       }
     }
@@ -74,6 +121,9 @@ export default function PlaygroundPage() {
         capability: latestActive.capability || "inference",
         budget_sats: latestActive.budget_sats,
         remaining_sats: latestActive.remaining_sats,
+        reserved_sats: latestActive.reserved_sats,
+        spent_sats: latestActive.spent_sats,
+        expires_at: latestActive.expires_at,
         macaroon: latestActive.macaroon,
         preimage: latestActive.preimage,
         invoice: latestActive.invoice,
@@ -82,8 +132,10 @@ export default function PlaygroundPage() {
         setMessages(latestActive.messages);
       }
       setSessionStatus("active");
+      setBalanceSyncStatus("syncing");
+      void synchronizeSession(latestActive);
     }
-  }, []);
+  }, [synchronizeSession]);
 
   const handleBudgetChange = (budget: number) => {
     setSessionData((prev) => ({ ...prev, budget_sats: budget, remaining_sats: budget }));
@@ -93,6 +145,7 @@ export default function PlaygroundPage() {
   const handleResetSession = () => {
     clearActiveSessionId();
     setSessionStatus("idle");
+    setBalanceSyncStatus("unavailable");
     setSessionData({ budget_sats: 100, model: "llama3.2" });
     setMessages([]);
     setErrorMessage(null);
@@ -106,48 +159,65 @@ export default function PlaygroundPage() {
       setErrorMessage(null);
       setSessionStatus("creating");
       await createSession(sessionData.budget_sats);
-    } catch (e: any) {
+    } catch (e: unknown) {
       if (e instanceof L402Error) {
+        const pending = sessionFromChallenge(e.challenge, sessionData.model || "llama3.2");
+        if (!pending) {
+          setSessionStatus("error");
+          setErrorMessage("The node returned an incomplete or invalid L402 session challenge.");
+          return;
+        }
+        if (!savePendingStoredSession(pending)) {
+          setSessionStatus("error");
+          setErrorMessage("Could not save this pending session locally. Existing session data was preserved.");
+          return;
+        }
+        setActiveSessionId(pending.id);
         setSessionStatus("payment_required");
         setSessionData((prev) => ({
           ...prev,
-          invoice: e.challenge.invoice,
-          macaroon: e.challenge.macaroon,
-          id: e.challenge.parsedCaveats?.session,
-          capability: e.challenge.parsedCaveats?.capability,
-          budget_sats: parseInt(e.challenge.parsedCaveats?.budget || `${sessionData.budget_sats}`, 10),
-          remaining_sats: parseInt(e.challenge.parsedCaveats?.budget || `${sessionData.budget_sats}`, 10),
+          invoice: pending.invoice,
+          macaroon: pending.macaroon,
+          id: pending.id,
+          capability: pending.capability,
+          budget_sats: pending.budget_sats,
+          remaining_sats: pending.remaining_sats,
         }));
       } else {
         setSessionStatus("error");
-        setErrorMessage(e?.message || "Failed to create session on SatsGrid node.");
+        setErrorMessage(e instanceof Error ? e.message : "Failed to create session on SatsGrid node.");
       }
     }
   };
 
   const activateSessionWithPreimage = (preimage: string) => {
-    setSessionData((prev) => {
-      const updated = { ...prev, preimage };
-      const sessionId = updated.id || `sess_${Date.now()}`;
-      const sessionRecord: StoredSession = {
-        id: sessionId,
-        status: "active",
-        model: updated.model || "llama3.2",
-        capability: updated.capability || "inference",
-        budget_sats: updated.budget_sats || 100,
-        remaining_sats: updated.remaining_sats ?? updated.budget_sats ?? 100,
-        macaroon: updated.macaroon || "",
-        preimage,
-        invoice: updated.invoice,
-        created_at: new Date().toISOString(),
-        requests_count: 0,
-        messages: [],
-      };
-      saveStoredSession(sessionRecord);
-      setActiveSessionId(sessionId);
-      return { ...updated, id: sessionId };
-    });
-    setSessionStatus("active");
+    const sessionId = sessionData.id;
+    if (!sessionId || !sessionData.macaroon || !sessionData.invoice || !/^[0-9a-f]{64}$/i.test(preimage)) {
+      setErrorMessage("Payment proof or session details are incomplete.");
+      setSessionStatus(walletFailureStatus());
+      return;
+    }
+    const stored = getStoredSessionById(sessionId);
+    const pending = stored && attachPaymentProof(stored, preimage);
+    if (!pending) {
+      setErrorMessage("The saved session could not be updated; existing session data was preserved.");
+      setSessionStatus("payment_required");
+      return;
+    }
+    if (!savePendingStoredSession(pending)) {
+      // Keep the returned proof in memory so a storage quota failure cannot force
+      // the user to pay this already-paid invoice again in the current tab.
+      setSessionData((prev) => ({ ...prev, preimage: pending.preimage }));
+      setErrorMessage("Payment proof is available for this tab, but local storage could not save it. Keep this tab open while you retry inference.");
+      setSessionStatus("payment_submitted");
+      return;
+    }
+    setActiveSessionId(sessionId);
+    setSessionData((prev) => ({ ...prev, preimage }));
+    setErrorMessage(null);
+    // A wallet result is not backend verification. Keep the session pending until
+    // the first authenticated inference response is accepted.
+    setSessionStatus("payment_submitted");
   };
 
   const handlePayInvoice = async () => {
@@ -158,9 +228,9 @@ export default function PlaygroundPage() {
       const webln = await requestProvider();
       const paymentResponse = await webln.sendPayment(invoiceStr);
       activateSessionWithPreimage(paymentResponse.preimage);
-    } catch (err: any) {
-      console.error("WebLN Payment failed:", err);
-      setSessionStatus("payment_required");
+    } catch {
+      setErrorMessage("Wallet payment was cancelled or failed. The pending invoice and session are unchanged.");
+      setSessionStatus(walletFailureStatus());
     }
   };
 
@@ -173,15 +243,44 @@ export default function PlaygroundPage() {
       const webln = await requestProvider();
       const paymentResponse = await webln.sendPayment(invoiceStr);
       activateSessionWithPreimage(paymentResponse.preimage);
-    } catch (err: any) {
-      console.error("NWC Payment failed:", err);
-      setSessionStatus("payment_required");
-      throw err;
+    } catch {
+      setErrorMessage("Wallet payment was cancelled or failed. The pending invoice and session are unchanged.");
+      setSessionStatus(walletFailureStatus());
+      throw new Error("Wallet payment was cancelled or failed.");
     }
   };
 
   const handleManualPreimage = (preimage: string) => {
     activateSessionWithPreimage(preimage);
+  };
+
+  const handleRecoverSession = (credentials: RecoveryCredentials) => {
+    const recovered = recoverySession(credentials, sessionData.model || "llama3.2");
+    if (!recovered) {
+      setErrorMessage("Recovery details are incomplete or invalid.");
+      return false;
+    }
+    if (!savePendingStoredSession(recovered)) {
+      setErrorMessage("A session with this ID already exists with different credentials or state.");
+      return false;
+    }
+    setActiveSessionId(recovered.id);
+    setSessionData({
+      id: recovered.id,
+      model: recovered.model,
+      capability: recovered.capability,
+      budget_sats: recovered.budget_sats,
+      remaining_sats: recovered.remaining_sats,
+      macaroon: recovered.macaroon,
+      preimage: recovered.preimage,
+      invoice: recovered.invoice,
+    });
+    setMessages([]);
+    setErrorMessage(null);
+    setSessionStatus("payment_submitted");
+    setBalanceSyncStatus("syncing");
+    void synchronizeSession(recovered);
+    return true;
   };
 
   const handleSelectModel = (model: string) => {
@@ -198,6 +297,11 @@ export default function PlaygroundPage() {
       updateStoredSessionMessages(sessionData.id, newMessages);
     }
     setIsStreaming(true);
+    setBalanceSyncStatus("unavailable");
+    const wasBackendConfirmed = sessionStatus === "active";
+    if (!wasBackendConfirmed) setSessionStatus("authorizing");
+    let backendConfirmed = wasBackendConfirmed;
+    let observedRemaining = sessionData.remaining_sats ?? sessionData.budget_sats;
 
     try {
       // Add a placeholder assistant message
@@ -236,6 +340,8 @@ export default function PlaygroundPage() {
           });
         },
         (remaining) => {
+          observedRemaining = remaining;
+          if (remaining <= 0) setSessionStatus("exhausted");
           setSessionData((prev) => {
             if (prev.id) {
               updateStoredSessionBudget(prev.id, remaining, false);
@@ -245,6 +351,24 @@ export default function PlaygroundPage() {
               remaining_sats: remaining
             };
           });
+        },
+        () => {
+          backendConfirmed = true;
+          const id = sessionData.id;
+          if (!id) return;
+          const stored = getStoredSessionById(id);
+          if (!stored) return;
+          const confirmed = markBackendConfirmed(stored);
+          if (!confirmed || !saveStoredSession(confirmed)) {
+            setErrorMessage("The backend authorized this request, but the session status could not be saved locally.");
+          }
+          setSessionStatus("active");
+          if (confirmed) setErrorMessage(null);
+        },
+        async () => {
+          if (!sessionData.id) return;
+          const stored = getStoredSessionById(sessionData.id);
+          if (stored) await synchronizeSession(stored);
         }
       );
 
@@ -254,7 +378,14 @@ export default function PlaygroundPage() {
         updateStoredSessionMessages(sessionData.id, finalized);
       }
     } catch (e) {
-      console.error("Inference Error:", e);
+      const message = e instanceof Error ? e.message : "Inference request failed.";
+      setErrorMessage(message);
+      if (backendConfirmed) {
+        setSessionStatus(observedRemaining <= 0 ? "exhausted" : "active");
+      } else {
+        const httpStatus = e instanceof InferenceRequestError ? e.status : undefined;
+        setSessionStatus(inferenceFailureStatus(httpStatus, message, Boolean(sessionData.preimage)));
+      }
       setMessages((prev) => {
         const updated = [...prev];
         const last = updated[updated.length - 1];
@@ -288,6 +419,7 @@ export default function PlaygroundPage() {
             onManualPreimage={handleManualPreimage}
             onSendMessage={handleSendMessage}
             onSelectModel={handleSelectModel}
+            onStartNewSession={handleResetSession}
           />
         </section>
 
@@ -296,16 +428,15 @@ export default function PlaygroundPage() {
           <ProtocolPanel 
             sessionStatus={sessionStatus} 
             sessionData={sessionData}
+            balanceSyncStatus={balanceSyncStatus}
             errorMessage={errorMessage}
             onBudgetChange={handleBudgetChange}
             onStartSession={handleStartSession}
             onResetSession={handleResetSession}
+            onRecoverSession={handleRecoverSession}
           />
         </aside>
       </main>
     </div>
   );
 }
-
-
-

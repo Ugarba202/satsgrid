@@ -6,16 +6,24 @@ use satsgrid::config::schema::{NodeConfig, PricingConfig};
 use satsgrid::node::api::routes::create_routes;
 use satsgrid::node::api::AppState;
 use satsgrid::node::gate::challenge::L402Challenge;
-use satsgrid::node::gate::macaroon::Macaroon;
-use satsgrid::node::gate::{MacaroonService, SessionBudgetManager};
+use satsgrid::node::gate::macaroon::{Caveat, Macaroon};
+use satsgrid::node::gate::{L402Verifier, MacaroonService, SessionBudgetManager};
 use satsgrid::node::lightning::mock::MockLightningBackend;
 use satsgrid::node::proxy::openai::OpenAiProxy;
 use satsgrid::node::storage::Database;
 use serde_json::json;
 use std::sync::Arc;
 use tower::ServiceExt; // for `oneshot`
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+fn mock_lightning_config() -> satsgrid::config::schema::LightningConfig {
+    satsgrid::config::schema::LightningConfig {
+        allow_mock: true,
+        ..Default::default()
+    }
+}
 
 fn setup_app_with_config(config: NodeConfig) -> axum::Router {
     let proxy = OpenAiProxy::new(config.upstream.url.clone());
@@ -56,7 +64,7 @@ fn setup_app() -> axum::Router {
             url: "http://localhost:8080".to_string(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: ".satsgrid_test_data".to_string(),
         ..Default::default()
     };
@@ -85,6 +93,7 @@ async fn test_health_endpoint() {
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["status"], "ok");
     assert_eq!(body["service"], "satsgrid-node");
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(body["lightning"]["backend"], "mock");
     assert_eq!(body["lightning"]["network"], "testnet");
 }
@@ -127,6 +136,33 @@ async fn test_health_endpoint_lnd_mainnet() {
     assert!(body["lightning"].get("lnd_tls_cert_path").is_none());
     assert!(body["lightning"].get("lnd_rpc_host").is_none());
     assert!(body["lightning"].get("nwc_uri").is_none());
+}
+
+#[tokio::test]
+async fn mock_payment_endpoint_rejects_non_mock_backends() {
+    for backend in [
+        satsgrid::config::schema::LightningBackendType::Lnd,
+        satsgrid::config::schema::LightningBackendType::Nwc,
+    ] {
+        let mut config = NodeConfig::default();
+        config.server.host = "127.0.0.1".to_string();
+        config.lightning.backend = backend;
+        let app = setup_app_with_config(config);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/mock/pay")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"invoice":"test-only-invoice"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }
 
 #[tokio::test]
@@ -214,7 +250,7 @@ async fn test_models_endpoint_dynamic_upstream() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: ".satsgrid_test_data".to_string(),
         ..Default::default()
     };
@@ -229,7 +265,7 @@ async fn test_models_endpoint_dynamic_upstream() {
         live_pricing: std::sync::Arc::new(tokio::sync::RwLock::new(config.pricing.clone())),
         lightning,
         budget_manager,
-        macaroon_service,
+        macaroon_service: macaroon_service.clone(),
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
@@ -323,7 +359,7 @@ async fn test_chat_completions_pay_per_request_flow() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: ".satsgrid_test_data".to_string(),
         ..Default::default()
     };
@@ -483,7 +519,7 @@ async fn test_api_e2e_flow_with_budget_debit() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: ".satsgrid_test_data".to_string(),
         ..Default::default()
     };
@@ -620,7 +656,7 @@ async fn test_chat_completions_capability_authorization() {
             url: "http://localhost:8080".to_string(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: ".satsgrid_test_data".to_string(),
         ..Default::default()
     };
@@ -825,6 +861,249 @@ async fn test_node_stats_security_access_control() {
     let stats_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert!(stats_json.get("total_requests").is_some());
     assert!(stats_json.get("total_sats_earned").is_some());
+    assert!(stats_json.get("active_sessions").is_some());
+}
+
+#[tokio::test]
+async fn test_node_stats_database_derived_metrics_and_reconciliation() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db = std::sync::Arc::new(
+        satsgrid::node::storage::Database::init(directory.path())
+            .await
+            .unwrap(),
+    );
+
+    // 1. Create sessions: 2 active, 1 exhausted
+    let s1 = satsgrid::common::types::SessionId(uuid::Uuid::new_v4());
+    let s2 = satsgrid::common::types::SessionId(uuid::Uuid::new_v4());
+    let s3 = satsgrid::common::types::SessionId(uuid::Uuid::new_v4());
+
+    db.session_store()
+        .create_session(
+            &s1,
+            None,
+            satsgrid::common::types::Satoshis(100),
+            2000000000,
+        )
+        .await
+        .unwrap();
+    db.session_store()
+        .create_session(
+            &s2,
+            None,
+            satsgrid::common::types::Satoshis(100),
+            2000000000,
+        )
+        .await
+        .unwrap();
+    db.session_store()
+        .create_session(
+            &s3,
+            None,
+            satsgrid::common::types::Satoshis(100),
+            2000000000,
+        )
+        .await
+        .unwrap();
+    // Transition s3 to exhausted
+    sqlx::query("UPDATE sessions SET status = 'exhausted' WHERE id = ?1")
+        .bind(s3.0.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    // 2. Create requests:
+    // - r1: completed (10 sats)
+    // - r2: completed (15 sats)
+    // - r3: reconciliation_required (with quarantined reservation of 10 sats)
+    // - r4: failed (0 sats earned)
+    let requests = db.request_store();
+    requests
+        .create_request(
+            "req-1",
+            None,
+            Some(&s1),
+            None,
+            None,
+            "test-model",
+            satsgrid::node::storage::RequestMode::Streaming,
+            satsgrid::common::types::Satoshis(10),
+        )
+        .await
+        .unwrap();
+    requests.mark_processing("req-1").await.unwrap();
+    requests
+        .mark_completed("req-1", Some(10), Some(10))
+        .await
+        .unwrap();
+
+    requests
+        .create_request(
+            "req-2",
+            None,
+            Some(&s2),
+            None,
+            None,
+            "test-model",
+            satsgrid::node::storage::RequestMode::Streaming,
+            satsgrid::common::types::Satoshis(15),
+        )
+        .await
+        .unwrap();
+    requests.mark_processing("req-2").await.unwrap();
+    requests
+        .mark_completed("req-2", Some(15), Some(15))
+        .await
+        .unwrap();
+
+    // r3 has a reservation of 10 sats quarantined
+    db.session_store()
+        .reserve_budget(&s1, satsgrid::common::types::Satoshis(10), "res-3")
+        .await
+        .unwrap();
+    requests
+        .create_request(
+            "req-3",
+            None,
+            Some(&s1),
+            Some("res-3"),
+            None,
+            "test-model",
+            satsgrid::node::storage::RequestMode::Streaming,
+            satsgrid::common::types::Satoshis(10),
+        )
+        .await
+        .unwrap();
+    requests
+        .mark_ambiguous_reconciliation_required("req-3", "test_abort", "client abort")
+        .await
+        .unwrap();
+
+    // Insert reconciliation item
+    db.reconciliation_store()
+        .create_or_update_item(
+            satsgrid::node::storage::ReconciliationItemType::InferenceRequest,
+            "req-3",
+            None,
+            Some(&s1),
+            "test_abort",
+            Some("client abort error details"),
+            None,
+        )
+        .await
+        .unwrap();
+
+    requests
+        .create_request(
+            "req-4",
+            None,
+            Some(&s2),
+            None,
+            None,
+            "test-model",
+            satsgrid::node::storage::RequestMode::Streaming,
+            satsgrid::common::types::Satoshis(10),
+        )
+        .await
+        .unwrap();
+    requests
+        .mark_failed("req-4", "upstream_error", "failed upstream")
+        .await
+        .unwrap();
+
+    // Verify storage-level methods directly
+    assert_eq!(requests.count_completed_total().await.unwrap(), 2);
+    assert_eq!(requests.total_completed_revenue_sats().await.unwrap(), 25);
+    assert_eq!(db.session_store().count_active_sessions().await.unwrap(), 2);
+    assert_eq!(
+        db.reconciliation_store().count_unresolved().await.unwrap(),
+        1
+    );
+
+    // Verify reconciliation listing includes reserved_sats = 10
+    let recon_list = db
+        .reconciliation_store()
+        .list_items(
+            Some(satsgrid::node::storage::ReconciliationStatus::Unresolved),
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recon_list.len(), 1);
+    assert_eq!(recon_list[0].reference_id, "req-3");
+    assert_eq!(recon_list[0].reserved_sats, Some(10));
+
+    // Now test API layer
+    let mut config = satsgrid::config::schema::NodeConfig::default();
+    config.server.host = "127.0.0.1".to_string();
+    let lightning =
+        std::sync::Arc::new(satsgrid::node::lightning::mock::MockLightningBackend::new());
+    let state = satsgrid::node::api::AppState {
+        config: std::sync::Arc::new(config.clone()),
+        live_pricing: std::sync::Arc::new(tokio::sync::RwLock::new(config.pricing.clone())),
+        lightning: lightning.clone(),
+        budget_manager: Arc::new(SessionBudgetManager::new()),
+        macaroon_service: Arc::new(MacaroonService::new(
+            b"test-secret-key-0000000000000000".to_vec(),
+            "satsgrid-node",
+        )),
+        proxy: satsgrid::node::proxy::openai::OpenAiProxy::new("http://127.0.0.1:11434"),
+        stats: Arc::new(satsgrid::node::api::NodeStats::default()),
+        admin_token: Arc::new("test-admin-token".to_string()),
+        db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
+    };
+
+    let app = create_routes(state);
+
+    // 1. GET /v1/node/stats with admin token
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/node/stats")
+                .header("Authorization", "Bearer test-admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let stats: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(stats["total_requests"], 2);
+    assert_eq!(stats["total_sats_earned"], 25);
+    assert_eq!(stats["active_sessions"], 2);
+    assert_eq!(stats["reconciliation"]["unresolved_items"], 1);
+
+    // 2. GET /v1/node/reconciliation
+    let recon_resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/node/reconciliation?status=unresolved")
+                .header("Authorization", "Bearer test-admin-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(recon_resp.status(), StatusCode::OK);
+    let r_bytes = axum::body::to_bytes(recon_resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let r_json: serde_json::Value = serde_json::from_slice(&r_bytes).unwrap();
+    assert_eq!(r_json["count"], 1);
+    let item = &r_json["items"][0];
+    assert_eq!(item["reference_id"], "req-3");
+    assert_eq!(item["session_id"], s1.0.to_string());
+    assert_eq!(item["reserved_sats"], 10);
+    assert_eq!(item["status"], "unresolved");
 }
 
 #[tokio::test]
@@ -944,7 +1223,7 @@ async fn test_step2_test_a_unpaid_session_challenge() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -959,7 +1238,7 @@ async fn test_step2_test_a_unpaid_session_challenge() {
         live_pricing: std::sync::Arc::new(tokio::sync::RwLock::new(config.pricing.clone())),
         lightning,
         budget_manager,
-        macaroon_service,
+        macaroon_service: macaroon_service.clone(),
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-token".to_string()),
@@ -1047,7 +1326,7 @@ async fn test_step2_test_b_unpaid_inference_rejection() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -1176,7 +1455,7 @@ async fn test_step2_test_c_successful_lazy_activation_and_d_duplicate_activation
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -1362,7 +1641,7 @@ async fn test_step2_test_e_concurrent_first_requests() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -1511,7 +1790,7 @@ async fn test_step2_test_f_invalid_preimage_and_g_expired_session() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -1671,7 +1950,7 @@ async fn test_step2_test_h_restart_persistence() {
                 url: mock_server.uri(),
                 ..Default::default()
             },
-            lightning: satsgrid::config::schema::LightningConfig::default(),
+            lightning: mock_lightning_config(),
             data_dir: dir.path().to_str().unwrap().to_string(),
             ..Default::default()
         };
@@ -1756,7 +2035,7 @@ async fn test_step2_test_h_restart_persistence() {
                 url: mock_server.uri(),
                 ..Default::default()
             },
-            lightning: satsgrid::config::schema::LightningConfig::default(),
+            lightning: mock_lightning_config(),
             data_dir: dir.path().to_str().unwrap().to_string(),
             ..Default::default()
         };
@@ -2005,7 +2284,7 @@ async fn test_step2a_closed_session_rejected_and_balance_untouched() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -2181,7 +2460,7 @@ async fn test_step2a_streaming_lazy_activation() {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -2340,6 +2619,244 @@ async fn test_session_close_api_unauthorized_rejection() {
 }
 
 #[tokio::test]
+async fn session_read_returns_persisted_balances_only_to_matching_l402_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::init(dir.path()).await.unwrap());
+    let lightning = Arc::new(MockLightningBackend::new());
+    let budget_manager = Arc::new(SessionBudgetManager::with_store(db.session_store()));
+    let macaroon_service = Arc::new(MacaroonService::new(
+        b"test-secret-key-0000000000000000".to_vec(),
+        "satsgrid-node",
+    ));
+    let mut config = NodeConfig::default();
+    config.server.host = "127.0.0.1".to_string();
+    config.lightning = mock_lightning_config();
+    config.pricing = PricingConfig::new(satsgrid::common::types::Satoshis(10));
+    config.data_dir = dir.path().to_str().unwrap().to_string();
+    let state = AppState {
+        config: Arc::new(config.clone()),
+        live_pricing: Arc::new(tokio::sync::RwLock::new(config.pricing.clone())),
+        lightning: lightning.clone(),
+        budget_manager: budget_manager.clone(),
+        macaroon_service: macaroon_service.clone(),
+        proxy: OpenAiProxy::new(config.upstream.url.clone()),
+        stats: Arc::new(satsgrid::node::api::NodeStats::default()),
+        admin_token: Arc::new("test-admin-token".to_string()),
+        db: Some(db.clone()),
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
+    };
+    let app = create_routes(state);
+
+    let challenge_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/session/new")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "budget_sats": 500 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(challenge_response.status(), StatusCode::PAYMENT_REQUIRED);
+    let challenge = L402Challenge::from_header_value(
+        challenge_response
+            .headers()
+            .get("www-authenticate")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let preimage = lightning.pay_invoice(&challenge.invoice).await.unwrap();
+    let macaroon = Macaroon::from_base64(&challenge.macaroon).unwrap();
+    let (session_id, _) = SessionBudgetManager::extract_session_caveats(&macaroon);
+    let session_id = session_id.unwrap();
+    db.session_store()
+        .activate_session(&session_id, &macaroon.payment_hash())
+        .await
+        .unwrap();
+    budget_manager
+        .reserve_session(
+            &session_id,
+            satsgrid::common::types::Satoshis(10),
+            "read-spent",
+        )
+        .await
+        .unwrap();
+    budget_manager
+        .finalize_reservation("read-spent")
+        .await
+        .unwrap();
+    budget_manager
+        .reserve_session(
+            &session_id,
+            satsgrid::common::types::Satoshis(5),
+            "read-reserved",
+        )
+        .await
+        .unwrap();
+    let authorization = format!("L402 {}:{}", challenge.macaroon, preimage);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/session/{}", session_id.0))
+                .header("authorization", &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["session_id"], session_id.0.to_string());
+    assert_eq!(body["status"], "active");
+    assert_eq!(body["total_budget_sats"], 500);
+    assert_eq!(body["remaining_sats"], 485);
+    assert_eq!(body["reserved_sats"], 5);
+    assert_eq!(body["spent_sats"], 10);
+    assert_eq!(body["requests_count"], 0);
+    assert!(body.get("macaroon").is_none());
+    assert!(body.get("preimage").is_none());
+
+    // Insert 1 completed request and 1 failed request to verify only completed counts
+    db.request_store()
+        .create_request(
+            "req-completed-1",
+            None,
+            Some(&session_id),
+            None,
+            None,
+            "test-model",
+            satsgrid::node::storage::RequestMode::Streaming,
+            satsgrid::common::types::Satoshis(10),
+        )
+        .await
+        .unwrap();
+    db.request_store()
+        .mark_processing("req-completed-1")
+        .await
+        .unwrap();
+    db.request_store()
+        .mark_completed("req-completed-1", Some(10), Some(20))
+        .await
+        .unwrap();
+
+    db.request_store()
+        .create_request(
+            "req-failed-1",
+            None,
+            Some(&session_id),
+            None,
+            None,
+            "test-model",
+            satsgrid::node::storage::RequestMode::Streaming,
+            satsgrid::common::types::Satoshis(10),
+        )
+        .await
+        .unwrap();
+    db.request_store()
+        .mark_failed("req-failed-1", "test_failure", "upstream")
+        .await
+        .unwrap();
+
+    let count_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/session/{}", session_id.0))
+                .header("authorization", &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(count_response.status(), StatusCode::OK);
+    let count_bytes = axum::body::to_bytes(count_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let count_body: serde_json::Value = serde_json::from_slice(&count_bytes).unwrap();
+    assert_eq!(count_body["requests_count"], 1);
+
+    sqlx::query("UPDATE sessions SET expires_at = ?1 WHERE id = ?2")
+        .bind(chrono::Utc::now().timestamp() - 1)
+        .bind(session_id.0.to_string())
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let expired = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/session/{}", session_id.0))
+                .header("authorization", &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let expired_bytes = axum::body::to_bytes(expired.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let expired_body: serde_json::Value = serde_json::from_slice(&expired_bytes).unwrap();
+    assert_eq!(expired_body["status"], "expired");
+
+    let wrong_session = Uuid::new_v4();
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/session/{wrong_session}"))
+                .header("authorization", &authorization)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+
+    let unknown_id = Uuid::new_v4();
+    let unknown_preimage = "ab".repeat(32);
+    let unknown_hash = L402Verifier::hash_preimage(&unknown_preimage).unwrap();
+    lightning.simulate_payment(&unknown_hash).await;
+    let unknown_macaroon = macaroon_service
+        .mint(
+            &unknown_hash,
+            vec![
+                Caveat::Session(unknown_id.to_string()),
+                Caveat::Capability("inference".to_string()),
+                Caveat::ExpiresAt(chrono::Utc::now().timestamp() as u64 + 3600),
+            ],
+        )
+        .unwrap()
+        .to_base64()
+        .unwrap();
+    let unknown_auth = format!("L402 {unknown_macaroon}:{unknown_preimage}");
+    let missing = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/session/{unknown_id}"))
+                .header("authorization", &unknown_auth)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn test_session_close_api_l402_success_and_idempotency() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::init(dir.path()).await.unwrap());
@@ -2351,12 +2868,16 @@ async fn test_session_close_api_l402_success_and_idempotency() {
     ));
 
     let config = NodeConfig {
+        server: satsgrid::config::schema::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            ..Default::default()
+        },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: "http://localhost:8080".to_string(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -2494,12 +3015,16 @@ async fn test_session_close_api_admin_token() {
     ));
 
     let config = NodeConfig {
+        server: satsgrid::config::schema::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            ..Default::default()
+        },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: "http://localhost:8080".to_string(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
@@ -2615,12 +3140,16 @@ async fn test_durable_invoice_issuance_and_settlement_integration() {
         .await;
 
     let config = NodeConfig {
+        server: satsgrid::config::schema::ServerConfig {
+            host: "127.0.0.1".to_string(),
+            ..Default::default()
+        },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(15)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: mock_server.uri(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: mock_lightning_config(),
         data_dir: dir.path().to_str().unwrap().to_string(),
         ..Default::default()
     };
