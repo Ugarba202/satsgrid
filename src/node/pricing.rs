@@ -38,6 +38,35 @@ impl PricingCalculator {
         )
     }
 
+    /// Calculate total cost in Satoshis for a specific model record with optional overrides.
+    /// If per-model rates are set, they take precedence over the global config defaults.
+    pub fn calculate_cost_for_model(
+        &self,
+        model: Option<&crate::node::storage::model::ModelRecord>,
+        prompt_tokens: usize,
+        estimated_completion_tokens: Option<usize>,
+    ) -> Satoshis {
+        let base_sats = model
+            .and_then(|m| m.flat_rate_sats)
+            .unwrap_or(self.config.default_price_sats.0);
+        let prompt_rate = model
+            .and_then(|m| m.sats_per_prompt_token)
+            .unwrap_or(self.config.sats_per_prompt_token);
+        let completion_rate = model
+            .and_then(|m| m.sats_per_completion_token)
+            .unwrap_or(self.config.sats_per_completion_token);
+
+        let prompt_sats = (prompt_tokens as u64).saturating_mul(prompt_rate);
+        let completion_sats =
+            (estimated_completion_tokens.unwrap_or(0) as u64).saturating_mul(completion_rate);
+
+        Satoshis(
+            base_sats
+                .saturating_add(prompt_sats)
+                .saturating_add(completion_sats),
+        )
+    }
+
     /// Heuristic estimation of token count from raw text (~4 characters per token).
     pub fn estimate_tokens_from_text(text: &str) -> usize {
         let trimmed = text.trim();

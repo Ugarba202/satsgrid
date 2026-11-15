@@ -40,10 +40,14 @@ impl NostrDiscoveryClient {
     }
 
     /// Fetch announced nodes from the client's connected relays.
-    pub async fn fetch_announcements(
+    /// Performs cryptographic signature verification, freshness filtering (default 24h TTL),
+    /// and endpoint validation according to the validator policy.
+    pub async fn fetch_announcements_with_validator(
         &self,
         model: Option<&str>,
         timeout: Duration,
+        validator: &crate::discovery::security::EndpointValidator,
+        max_age_secs: Option<u64>,
     ) -> Result<Vec<NodeAnnouncement>> {
         let filter = NodeAnnouncement::create_filter(model);
         let events = self
@@ -53,9 +57,23 @@ impl NostrDiscoveryClient {
             .await
             .map_err(|e| Error::Config(format!("Failed to fetch discovery events: {}", e)))?;
 
+        let now = chrono::Utc::now().timestamp() as u64;
+        let max_age = max_age_secs.unwrap_or(86400); // 24 hours TTL
+
         let mut discovered = HashMap::new();
         for event in events {
+            let event_time = event.created_at.as_secs();
+            // Reject future-dated events (drift tolerance 300s) or stale events older than max_age
+            if event_time > now + 300 || now.saturating_sub(event_time) > max_age {
+                continue;
+            }
+
             if let Ok(announcement) = NodeAnnouncement::from_event(&event) {
+                // Endpoint security check: reject SSRF / private targets unless explicitly allowed
+                if validator.validate_url(&announcement.node_url).is_err() {
+                    continue;
+                }
+
                 let key = announcement
                     .pubkey
                     .clone()
@@ -65,6 +83,17 @@ impl NostrDiscoveryClient {
         }
 
         Ok(discovered.into_values().collect())
+    }
+
+    /// Fetch announced nodes from the client's connected relays.
+    pub async fn fetch_announcements(
+        &self,
+        model: Option<&str>,
+        timeout: Duration,
+    ) -> Result<Vec<NodeAnnouncement>> {
+        let default_validator = crate::discovery::security::EndpointValidator::new(true);
+        self.fetch_announcements_with_validator(model, timeout, &default_validator, None)
+            .await
     }
 
     /// Query relays for active SatsGrid node announcements matching optional model.

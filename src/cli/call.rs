@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 #[derive(Args, Debug)]
 pub struct CallArgs {
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
-    pub node: String,
+    #[arg(long)]
+    pub node: Option<String>,
 
     #[arg(long)]
     pub model: String,
@@ -102,6 +102,43 @@ impl LightningPaymentProvider for InteractiveOrMockPaymentProvider {
 }
 
 pub async fn handle_call_command(args: CallArgs) {
+    // Dynamic provider selection: if node URL is not provided, resolve via discovery
+    let target_node_url = if let Some(ref explicit_node) = args.node {
+        explicit_node.clone()
+    } else {
+        println!(
+            "Resolving provider serving model '{}' via Nostr discovery...",
+            args.model
+        );
+        let default_relays = vec![
+            "wss://relay.damus.io".to_string(),
+            "wss://nos.lol".to_string(),
+        ];
+        match crate::discovery::NostrDiscoveryClient::discover_nodes(
+            &default_relays,
+            Some(&args.model),
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        {
+            Ok(discovered) if !discovered.is_empty() => {
+                // Select the provider offering the lowest pricing_sats
+                let mut sorted = discovered;
+                sorted.sort_by_key(|p| p.pricing_sats);
+                let selected = &sorted[0];
+                println!(
+                    "✓ Discovered and selected provider '{}' ({}) at {} sats",
+                    selected.name, selected.node_url, selected.pricing_sats
+                );
+                selected.node_url.clone()
+            }
+            _ => {
+                println!("No remote provider discovered on relays; falling back to local node http://127.0.0.1:8080");
+                "http://127.0.0.1:8080".to_string()
+            }
+        }
+    };
+
     let payer_nwc_uri = args
         .payer_nwc_uri
         .clone()
@@ -126,7 +163,9 @@ pub async fn handle_call_command(args: CallArgs) {
                     e
                 );
                 (
-                    Arc::new(InteractiveOrMockPaymentProvider::new(args.node.clone())),
+                    Arc::new(InteractiveOrMockPaymentProvider::new(
+                        target_node_url.clone(),
+                    )),
                     "Interactive Lightning",
                 )
             }
@@ -149,20 +188,24 @@ pub async fn handle_call_command(args: CallArgs) {
             Err(e) => {
                 eprintln!("Warning: Failed to initialize payer LND backend ({}), falling back to interactive payment.", e);
                 (
-                    Arc::new(InteractiveOrMockPaymentProvider::new(args.node.clone())),
+                    Arc::new(InteractiveOrMockPaymentProvider::new(
+                        target_node_url.clone(),
+                    )),
                     "Interactive Lightning",
                 )
             }
         }
     } else {
         (
-            Arc::new(InteractiveOrMockPaymentProvider::new(args.node.clone())),
+            Arc::new(InteractiveOrMockPaymentProvider::new(
+                target_node_url.clone(),
+            )),
             "Lightning (L402)",
         )
     };
 
     println!("SatsGrid\n──────────────────────────────");
-    println!("Node:      {}", args.node);
+    println!("Node:      {}", target_node_url);
     println!("Model:     {}", args.model);
     println!("Budget:    {} sats", args.budget);
     println!("Payment:   {}\n", payment_mode);
@@ -170,7 +213,7 @@ pub async fn handle_call_command(args: CallArgs) {
     let budget_tracker = Arc::new(ClientBudgetTracker::new(args.budget));
 
     let client = match SatsGridClient::builder()
-        .node_url(args.node.clone())
+        .node_url(target_node_url.clone())
         .payment_provider(provider)
         .build()
     {

@@ -20,7 +20,7 @@ async fn persist_stream_completion(
     prompt_tokens: i64,
     charge_sats: u64,
     receipt: std::result::Result<Option<crate::node::receipt::SignedReceipt>, Error>,
-) {
+) -> Option<String> {
     let receipt = match receipt {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -36,7 +36,7 @@ async fn persist_stream_completion(
             {
                 tracing::error!(request_id = %request_id, error = %recovery_error, "Failed to persist streaming receipt-signing recovery state");
             }
-            return;
+            return None;
         }
     };
 
@@ -98,7 +98,7 @@ async fn persist_stream_completion(
             {
                 tracing::error!(request_id = %request_id, error = %recovery_error, "Failed to persist streaming finalization recovery state");
             }
-            return;
+            return None;
         }
     }
 
@@ -108,6 +108,8 @@ async fn persist_stream_completion(
     stats
         .total_sats_earned
         .fetch_add(charge_sats, std::sync::atomic::Ordering::SeqCst);
+
+    receipt.map(|r| r.payload.receipt_id)
 }
 
 pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
@@ -134,22 +136,184 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+pub async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(db) = &state.db {
+        match db.provider_store().list_providers(None).await {
+            Ok(providers) => {
+                let data: Vec<Value> = providers
+                    .into_iter()
+                    .map(|p| {
+                        json!({
+                            "pubkey": p.pubkey,
+                            "name": p.name,
+                            "endpoint": p.endpoint,
+                            "models": p.models,
+                            "pricing_sats": p.pricing_sats,
+                            "network": p.network,
+                            "version": p.version,
+                            "receipt_key_id": p.receipt_key_id,
+                            "status": p.status,
+                            "last_seen_at": p.last_seen_at,
+                            "last_checked_at": p.last_checked_at,
+                            "last_error": p.last_error,
+                        })
+                    })
+                    .collect();
+                (StatusCode::OK, Json(json!({ "providers": data }))).into_response()
+            }
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to list providers: {}", e) })),
+            )
+                .into_response(),
+        }
+    } else {
+        (StatusCode::OK, Json(json!({ "providers": [] }))).into_response()
+    }
+}
+
+pub async fn get_provider(
+    State(state): State<AppState>,
+    axum::extract::Path(pubkey): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(db) = &state.db {
+        match db.provider_store().get_provider(&pubkey).await {
+            Ok(Some(p)) => (
+                StatusCode::OK,
+                Json(json!({
+                    "pubkey": p.pubkey,
+                    "name": p.name,
+                    "endpoint": p.endpoint,
+                    "models": p.models,
+                    "pricing_sats": p.pricing_sats,
+                    "network": p.network,
+                    "version": p.version,
+                    "receipt_key_id": p.receipt_key_id,
+                    "status": p.status,
+                    "last_seen_at": p.last_seen_at,
+                    "last_checked_at": p.last_checked_at,
+                    "last_error": p.last_error,
+                })),
+            )
+                .into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Provider '{}' not found", pubkey) })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to get provider: {}", e) })),
+            )
+                .into_response(),
+        }
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Provider store unavailable" })),
+        )
+            .into_response()
+    }
+}
+
 pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
+    if let Some(db) = &state.db {
+        let model_store = db.model_store();
+        match model_store.list_models(Some(true), Some(true)).await {
+            Ok(models) if !models.is_empty() => {
+                let data: Vec<Value> = models
+                    .into_iter()
+                    .map(|m| {
+                        json!({
+                            "id": m.id,
+                            "object": "model",
+                            "created": m.created_at,
+                            "owned_by": m.owned_by,
+                            "description": m.description,
+                            "context_length": m.context_length,
+                            "pricing": {
+                                "flat_rate_sats": m.flat_rate_sats,
+                                "sats_per_prompt_token": m.sats_per_prompt_token,
+                                "sats_per_completion_token": m.sats_per_completion_token,
+                            }
+                        })
+                    })
+                    .collect();
+                return Json(json!({ "object": "list", "data": data }));
+            }
+            Ok(_) => {
+                // Store is empty: attempt lazy synchronization from upstream proxy
+                if let Ok(val) = state.proxy.list_models().await {
+                    let mut discovered_models = Vec::new();
+                    if let Some(arr) = val.get("data").and_then(|d| d.as_array()) {
+                        for item in arr {
+                            if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
+                                discovered_models.push(
+                                    crate::node::storage::model::DiscoveredModel {
+                                        id: id.to_string(),
+                                        name: item
+                                            .get("name")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or(id)
+                                            .to_string(),
+                                        owned_by: item
+                                            .get("owned_by")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| s.to_string()),
+                                        description: item
+                                            .get("description")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| s.to_string()),
+                                        context_length: item
+                                            .get("context_length")
+                                            .and_then(|v| v.as_i64()),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if !discovered_models.is_empty() {
+                        let _ = model_store
+                            .upsert_discovered(&discovered_models, false)
+                            .await;
+                        if let Ok(fresh) = model_store.list_models(Some(true), Some(true)).await {
+                            if !fresh.is_empty() {
+                                let data: Vec<Value> = fresh
+                                    .into_iter()
+                                    .map(|m| {
+                                        json!({
+                                            "id": m.id,
+                                            "object": "model",
+                                            "created": m.created_at,
+                                            "owned_by": m.owned_by,
+                                            "description": m.description,
+                                            "context_length": m.context_length,
+                                            "pricing": {
+                                                "flat_rate_sats": m.flat_rate_sats,
+                                                "sats_per_prompt_token": m.sats_per_prompt_token,
+                                                "sats_per_completion_token": m.sats_per_completion_token,
+                                            }
+                                        })
+                                    })
+                                    .collect();
+                                return Json(json!({ "object": "list", "data": data }));
+                            }
+                        }
+                    }
+                }
+                return Json(json!({ "object": "list", "data": [] }));
+            }
+            Err(e) => {
+                tracing::error!("Failed to query ModelStore for /v1/models: {}", e);
+                return Json(json!({ "object": "list", "data": [] }));
+            }
+        }
+    }
+
+    // Fallback if no database handle is configured (e.g. lightweight unit test harnesses)
     match state.proxy.list_models().await {
         Ok(upstream_models) => Json(upstream_models),
-        Err(e) => {
-            tracing::warn!(
-                "Failed to query upstream models, falling back to default: {}",
-                e
-            );
-            let data = vec![json!({
-                "id": "llama3.2",
-                "object": "model",
-                "created": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
-                "owned_by": "satsgrid-node"
-            })];
-            Json(json!({ "object": "list", "data": data }))
-        }
+        Err(_) => Json(json!({ "object": "list", "data": [] })),
     }
 }
 
@@ -253,10 +417,22 @@ pub async fn chat_completions(
 
     let prompt_tokens = validated.prompt_tokens;
     let max_completion_tokens = validated.max_tokens;
-    let cost = state
-        .pricing_calculator()
-        .await
-        .calculate_cost(prompt_tokens, max_completion_tokens);
+
+    // Check durable ModelStore for model record and pricing overrides
+    let model_record = if let Some(db) = &state.db {
+        db.model_store()
+            .get_model(&validated.model)
+            .await
+            .unwrap_or(None)
+    } else {
+        None
+    };
+
+    let cost = state.pricing_calculator().await.calculate_cost_for_model(
+        model_record.as_ref(),
+        prompt_tokens,
+        max_completion_tokens,
+    );
     let req_model = Some(validated.model.as_str());
 
     let auth_header = headers.get("Authorization");
@@ -650,6 +826,34 @@ pub async fn chat_completions(
         let prompt_tokens_i64 = prompt_tokens as i64;
         let stats_for_stream = state.stats.clone();
 
+        fn strip_done_marker(tail: &mut Vec<u8>, bytes: &[u8]) -> (Option<Vec<u8>>, bool) {
+            let mut combined = std::mem::take(tail);
+            let tail_len = combined.len();
+            combined.extend_from_slice(bytes);
+
+            if let Some(idx) = combined
+                .windows(b"[DONE]".len())
+                .position(|w| w == b"[DONE]")
+            {
+                let line_start = combined[..idx].iter().rposition(|&b| b == b'\n');
+                let prefix = match line_start {
+                    Some(pos) => {
+                        if pos + 1 <= tail_len {
+                            Vec::new()
+                        } else {
+                            combined[tail_len..=pos].to_vec()
+                        }
+                    }
+                    None => Vec::new(),
+                };
+                (Some(prefix), true)
+            } else {
+                let new_tail_start = combined.len().saturating_sub(b"[DONE]".len() - 1);
+                *tail = combined[new_tail_start..].to_vec();
+                (Some(bytes.to_vec()), false)
+            }
+        }
+
         struct MonitoredStream<S> {
             inner: S,
             req_id: String,
@@ -669,6 +873,9 @@ pub async fn chat_completions(
             idle_timeout: std::time::Duration,
             error_emitted: bool,
             _permit: crate::node::concurrency::ConcurrencyPermit,
+            finalizer: Option<Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>>>,
+            pending_emission: Option<bytes::Bytes>,
+            done_emitted: bool,
         }
 
         impl<S> Drop for MonitoredStream<S> {
@@ -714,7 +921,44 @@ pub async fn chat_completions(
                 mut self: Pin<&mut Self>,
                 cx: &mut Context<'_>,
             ) -> Poll<Option<Self::Item>> {
-                // 1. Check overall request deadline
+                // 1. Yield any buffered pending emission (e.g. terminal [DONE] after receipt)
+                if let Some(pending) = self.pending_emission.take() {
+                    return Poll::Ready(Some(Ok(pending)));
+                }
+
+                // 2. If [DONE] was already emitted, the stream is finished
+                if self.done_emitted {
+                    return Poll::Ready(None);
+                }
+
+                // 3. If finalizer future is running, poll it
+                if let Some(mut fut) = self.finalizer.take() {
+                    match fut.as_mut().poll(cx) {
+                        Poll::Pending => {
+                            self.finalizer = Some(fut);
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(receipt_id_opt) => {
+                            self.completed.store(true, Ordering::SeqCst);
+                            self.done_emitted = true;
+                            if let Some(receipt_id) = receipt_id_opt {
+                                let sse_receipt = format!(
+                                    "event: receipt\ndata: {{\"choices\":[],\"receipt_id\":\"{}\"}}\n\n",
+                                    receipt_id
+                                );
+                                self.pending_emission =
+                                    Some(bytes::Bytes::from("data: [DONE]\n\n"));
+                                return Poll::Ready(Some(Ok(bytes::Bytes::from(sse_receipt))));
+                            } else {
+                                return Poll::Ready(Some(Ok(bytes::Bytes::from(
+                                    "data: [DONE]\n\n",
+                                ))));
+                            }
+                        }
+                    }
+                }
+
+                // 4. Check overall request deadline
                 if std::time::Instant::now() >= self.deadline {
                     if !self.error_emitted {
                         self.error_emitted = true;
@@ -750,22 +994,30 @@ pub async fn chat_completions(
                     return Poll::Ready(None);
                 }
 
-                // 2. Poll inner stream for new data
+                // 5. Poll inner stream for new data
                 match Pin::new(&mut self.inner).poll_next(cx) {
                     Poll::Ready(Some(Ok(bytes))) => {
-                        if !self.saw_done_marker {
-                            let mut marker_bytes = std::mem::take(&mut self.terminal_marker_tail);
-                            marker_bytes.extend_from_slice(&bytes);
-                            self.saw_done_marker = marker_bytes
-                                .windows(b"[DONE]".len())
-                                .any(|window| window == b"[DONE]");
-                            let tail_start = marker_bytes.len().saturating_sub(b"[DONE]".len() - 1);
-                            self.terminal_marker_tail = marker_bytes[tail_start..].to_vec();
+                        let mut tail = std::mem::take(&mut self.terminal_marker_tail);
+                        let (prefix_opt, has_done) = strip_done_marker(&mut tail, &bytes);
+                        self.terminal_marker_tail = tail;
+                        if has_done {
+                            self.saw_done_marker = true;
                         }
+
                         // Reset idle sleep timer only upon actual data receipt!
                         let next_wake = tokio::time::Instant::now() + self.idle_timeout;
                         self.idle_sleep.as_mut().reset(next_wake);
-                        Poll::Ready(Some(Ok(bytes)))
+
+                        if let Some(prefix) = prefix_opt {
+                            if !prefix.is_empty() {
+                                return Poll::Ready(Some(Ok(bytes::Bytes::from(prefix))));
+                            }
+                        }
+
+                        if has_done {
+                            cx.waker().wake_by_ref();
+                        }
+                        Poll::Pending
                     }
                     Poll::Ready(Some(Err(e))) => {
                         self.completed.store(true, Ordering::SeqCst);
@@ -803,61 +1055,64 @@ pub async fn chat_completions(
                         if !self.saw_done_marker {
                             return Poll::Ready(None);
                         }
-                        if !self.completed.swap(true, Ordering::SeqCst) {
-                            if let Some(db) = self.db.clone() {
-                                let r_id = self.req_id.clone();
-                                let p_tok = self.prompt_tokens;
-                                let session_id = self.session_id.clone();
-                                let reservation_id = self.session_reservation_id.clone();
-                                let model = self.model.clone();
-                                let payment_hash = self.payment_hash.clone();
-                                let charge_sats = self.charge_sats;
-                                let stats = self.stats.clone();
-                                tokio::spawn(async move {
-                                    let receipt = if let Some(signer) = AppState::receipt_signer() {
-                                        let receipt_id =
-                                            format!("rcpt_{}", uuid::Uuid::new_v4().simple());
-                                        let payload = crate::node::receipt::ReceiptPayload {
-                                            receipt_id,
-                                            schema_version: 1,
-                                            key_id: signer.key_id().to_string(),
-                                            provider_id: signer.provider_id().to_string(),
-                                            request_id: r_id.clone(),
-                                            session_id: session_id
-                                                .as_ref()
-                                                .map(|id| id.0.to_string()),
-                                            model,
-                                            inference_status: "completed".to_string(),
-                                            payment_status: "settled".to_string(),
-                                            payment_hash: Some(payment_hash.0),
-                                            approved_max_sats: charge_sats,
-                                            actual_charge_sats: charge_sats,
-                                            currency: "sats".to_string(),
-                                            prompt_tokens: Some(p_tok),
-                                            completion_tokens: None,
-                                            error_code: None,
-                                            reconciliation_id: None,
-                                            supersedes_receipt_id: None,
-                                            created_at: chrono::Utc::now().timestamp(),
-                                        };
-                                        signer.sign_receipt(payload).map(Some)
-                                    } else {
-                                        Ok(None)
+
+                        if let Some(db) = self.db.clone() {
+                            let r_id = self.req_id.clone();
+                            let p_tok = self.prompt_tokens;
+                            let session_id = self.session_id.clone();
+                            let reservation_id = self.session_reservation_id.clone();
+                            let model = self.model.clone();
+                            let payment_hash = self.payment_hash.clone();
+                            let charge_sats = self.charge_sats;
+                            let stats = self.stats.clone();
+                            let fut = Box::pin(async move {
+                                let receipt = if let Some(signer) = AppState::receipt_signer() {
+                                    let receipt_id =
+                                        format!("rcpt_{}", uuid::Uuid::new_v4().simple());
+                                    let payload = crate::node::receipt::ReceiptPayload {
+                                        receipt_id,
+                                        schema_version: 1,
+                                        key_id: signer.key_id().to_string(),
+                                        provider_id: signer.provider_id().to_string(),
+                                        request_id: r_id.clone(),
+                                        session_id: session_id.as_ref().map(|id| id.0.to_string()),
+                                        model,
+                                        inference_status: "completed".to_string(),
+                                        payment_status: "settled".to_string(),
+                                        payment_hash: Some(payment_hash.0),
+                                        approved_max_sats: charge_sats,
+                                        actual_charge_sats: charge_sats,
+                                        currency: "sats".to_string(),
+                                        prompt_tokens: Some(p_tok),
+                                        completion_tokens: None,
+                                        error_code: None,
+                                        reconciliation_id: None,
+                                        supersedes_receipt_id: None,
+                                        created_at: chrono::Utc::now().timestamp(),
                                     };
-                                    persist_stream_completion(
-                                        db,
-                                        stats,
-                                        r_id,
-                                        reservation_id,
-                                        p_tok,
-                                        charge_sats,
-                                        receipt,
-                                    )
-                                    .await;
-                                });
-                            }
+                                    signer.sign_receipt(payload).map(Some)
+                                } else {
+                                    Ok(None)
+                                };
+                                persist_stream_completion(
+                                    db,
+                                    stats,
+                                    r_id,
+                                    reservation_id,
+                                    p_tok,
+                                    charge_sats,
+                                    receipt,
+                                )
+                                .await
+                            });
+                            self.finalizer = Some(fut);
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
-                        Poll::Ready(None)
+
+                        self.completed.store(true, Ordering::SeqCst);
+                        self.done_emitted = true;
+                        Poll::Ready(Some(Ok(bytes::Bytes::from("data: [DONE]\n\n"))))
                     }
                     Poll::Pending => {
                         // 3. Poll idle sleep timer
@@ -927,6 +1182,9 @@ pub async fn chat_completions(
             idle_timeout,
             error_emitted: false,
             _permit: concurrency_permit,
+            finalizer: None,
+            pending_emission: None,
+            done_emitted: false,
         };
 
         // MonitoredStream has assumed ownership; defuse dispatch guard
@@ -1015,10 +1273,37 @@ pub async fn chat_completions(
                         supersedes_receipt_id: None,
                         created_at: chrono::Utc::now().timestamp(),
                     };
-                    if let Ok(signed) = signer.sign_receipt(payload) {
-                        let _ = db.receipt_store().create_receipt(&signed).await;
-                        response_headers
-                            .insert("x-satsgrid-receipt-id", receipt_id.parse().unwrap());
+                    match signer.sign_receipt(payload) {
+                        Ok(signed) => match db.receipt_store().create_receipt(&signed).await {
+                            Ok(()) => match receipt_id.parse() {
+                                Ok(header_val) => {
+                                    response_headers.insert("x-satsgrid-receipt-id", header_val);
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        request_id = %internal_request_id,
+                                        receipt_id = %receipt_id,
+                                        error = %err,
+                                        "Failed to parse receipt ID as HTTP header value"
+                                    );
+                                }
+                            },
+                            Err(err) => {
+                                tracing::error!(
+                                    request_id = %internal_request_id,
+                                    receipt_id = %receipt_id,
+                                    error = %err,
+                                    "Failed to persist signed receipt for completed non-streaming request"
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            tracing::error!(
+                                request_id = %internal_request_id,
+                                error = %err,
+                                "Failed to sign receipt for completed non-streaming request"
+                            );
+                        }
                     }
                 }
 
@@ -1060,6 +1345,12 @@ pub async fn node_stats(
         requests,
         earned,
         active_sessions,
+        reserved_sats,
+        completed_reqs,
+        failed_reqs,
+        recon_reqs,
+        model_breakdown_data,
+        recent_reqs_data,
         pending_inv,
         settled_inv,
         expired_inv,
@@ -1088,6 +1379,14 @@ pub async fn node_stats(
                     .load(std::sync::atomic::Ordering::SeqCst)
             });
         let active_sess = session_store.count_active_sessions().await.unwrap_or(0);
+        let total_reserved = session_store.total_reserved_sats().await.unwrap_or(0);
+
+        let completed_c = total_reqs;
+        let failed_c = req_store.count_by_status("failed").await.unwrap_or(0);
+        let recon_c = req_store.count_by_status("reconciliation_required").await.unwrap_or(0);
+
+        let models = req_store.model_activity_breakdown().await.unwrap_or_default();
+        let recent = req_store.fetch_recent_requests(10).await.unwrap_or_default();
 
         let p = inv_store
             .count_by_status(crate::node::storage::InvoiceStatus::Pending)
@@ -1124,6 +1423,12 @@ pub async fn node_stats(
             total_reqs,
             total_earned,
             active_sess,
+            total_reserved,
+            completed_c,
+            failed_c,
+            recon_c,
+            models,
+            recent,
             p,
             s,
             exp,
@@ -1140,13 +1445,45 @@ pub async fn node_stats(
             .stats
             .total_sats_earned
             .load(std::sync::atomic::Ordering::SeqCst);
-        (requests, earned, 0, 0, 0, 0, 0, 0, None)
+        (requests, earned, 0, 0, requests, 0, 0, Vec::new(), Vec::new(), 0, 0, 0, 0, 0, None)
     };
+
+    let model_breakdown_json: Vec<_> = model_breakdown_data
+        .into_iter()
+        .map(|(model, cnt, rev)| {
+            json!({
+                "model": model,
+                "completed_requests": cnt,
+                "sats_earned": rev,
+            })
+        })
+        .collect();
+
+    let recent_requests_json: Vec<_> = recent_reqs_data
+        .into_iter()
+        .map(|(id, model, status, charged_sats, created_at)| {
+            json!({
+                "id": id,
+                "model": model,
+                "status": status,
+                "charged_sats": charged_sats,
+                "created_at": created_at,
+            })
+        })
+        .collect();
 
     Ok(Json(json!({
         "total_requests": requests,
         "total_sats_earned": earned,
         "active_sessions": active_sessions,
+        "reserved_sats": reserved_sats,
+        "requests_breakdown": {
+            "completed": completed_reqs,
+            "failed": failed_reqs,
+            "reconciliation_required": recon_reqs,
+        },
+        "model_breakdown": model_breakdown_json,
+        "recent_requests": recent_requests_json,
         "invoices": {
             "pending": pending_inv,
             "settled": settled_inv,

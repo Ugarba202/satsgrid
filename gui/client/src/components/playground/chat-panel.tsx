@@ -1,15 +1,20 @@
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { ModelSelector } from "./model-selector";
-import { Send, Bot, User, Lock, Zap, QrCode, Copy, Check, Clock, AlertCircle, RefreshCw, PlusCircle, AlertTriangle } from "lucide-react";
+import { Send, Bot, User, Lock, Zap, QrCode, Copy, Check, Clock, AlertCircle, RefreshCw, PlusCircle, AlertTriangle, ShieldCheck, Mic, MicOff, Volume2, Square } from "lucide-react";
 import { SessionStatus, SessionData } from "@/types/session";
 import { SatsAmount } from "@/components/satsgrid/sats-amount";
 import { resolveNetworkIdentity } from "@/lib/api/network";
 import { fetchNodeHealth, type NodeLightningInfo } from "@/lib/api/node";
 import { parseBolt11Expiry, formatSecondsRemaining, type Bolt11ExpiryInfo } from "@/lib/api/bolt11";
 import { LightningQrCode } from "@/components/satsgrid/lightning-qr-code";
+import { ReceiptDialog } from "./receipt-dialog";
 import { Message } from "@/types/inference";
 import { useState, useEffect, KeyboardEvent, useMemo } from "react";
+import { useSpeechRecognition } from "@/lib/speech/useSpeechRecognition";
+import { useSpeechSynthesis } from "@/lib/speech/useSpeechSynthesis";
+import { fetchNodeModels, type ModelEntry } from "@/lib/api/node";
+import { estimateInferenceCost, type CostEstimateResult } from "@/lib/pricing/estimate";
 
 interface ChatPanelProps {
   sessionStatus: SessionStatus;
@@ -38,16 +43,81 @@ export function ChatPanel({
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [manualPreimage, setManualPreimage] = useState("");
+  const [selectedReceiptId, setSelectedReceiptId] = useState<string | null>(null);
+  const [isReceiptDialogOpen, setIsReceiptDialogOpen] = useState(false);
   const [nwcUri, setNwcUri] = useState("");
   const [nwcError, setNwcError] = useState<string | null>(null);
   const [isPayingNwc, setIsPayingNwc] = useState(false);
-  const [copied, setCopied] = useState(false);
   const [preimageError, setPreimageError] = useState<string | null>(null);
   const [isPayingMock, setIsPayingMock] = useState(false);
   const [nodeLightning, setNodeLightning] = useState<NodeLightningInfo | null>(null);
   const [showQr, setShowQr] = useState(true);
   const [nowSec, setNowSec] = useState(() => Math.floor(Date.now() / 1000));
   const [copyFeedback, setCopyFeedback] = useState<"idle" | "success" | "error">("idle");
+  const [activeSpeechMessageIndex, setActiveSpeechMessageIndex] = useState<number | null>(null);
+  const [availableModels, setAvailableModels] = useState<ModelEntry[]>([]);
+
+  // Load models for pricing metadata
+  useEffect(() => {
+    let active = true;
+    fetchNodeModels()
+      .then((models) => {
+        if (active) setAvailableModels(models);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const activeModelEntry = useMemo(() => {
+    const selectedId = sessionData.model || "llama3.2";
+    return availableModels.find((m) => m.id === selectedId) || null;
+  }, [availableModels, sessionData.model]);
+
+  const costEstimate: CostEstimateResult = useMemo(() => {
+    return estimateInferenceCost({
+      text: input,
+      modelId: sessionData.model || "llama3.2",
+      modelEntry: activeModelEntry,
+    });
+  }, [input, sessionData.model, activeModelEntry]);
+
+  // Speech Recognition (Voice Input)
+  const {
+    isSupported: isSpeechRecSupported,
+    state: speechRecState,
+    startListening,
+    stopListening,
+    error: speechRecError,
+  } = useSpeechRecognition({
+    onTranscript: (newTranscript) => {
+      // Voice input safety: ONLY populates input field, NEVER auto-submits
+      setInput((prev) => {
+        const trimmed = prev.trim();
+        return trimmed ? `${trimmed} ${newTranscript}` : newTranscript;
+      });
+    },
+  });
+
+  // Speech Synthesis (Read-Aloud)
+  const {
+    isSupported: isSpeechSynthSupported,
+    isSpeaking,
+    speak,
+    stop: stopSpeaking,
+  } = useSpeechSynthesis({
+    onEnd: () => setActiveSpeechMessageIndex(null),
+    onError: () => setActiveSpeechMessageIndex(null),
+  });
+
+  // Stop speech if conversation or active session changes
+  useEffect(() => {
+    return () => {
+      stopSpeaking();
+      stopListening();
+    };
+  }, [sessionData.id, stopSpeaking, stopListening]);
 
   // Keep current time updated for live expiry tracking
   useEffect(() => {
@@ -148,10 +218,8 @@ export function ChatPanel({
         document.execCommand("copy");
         textArea.remove();
       }
-      setCopied(true);
       setCopyFeedback("success");
       setTimeout(() => {
-        setCopied(false);
         setCopyFeedback("idle");
       }, 2500);
     } catch (err) {
@@ -358,21 +426,22 @@ export function ChatPanel({
                     <button
                       onClick={handleCopyInvoice}
                       disabled={!sessionData.invoice}
-                      className="text-xs text-lightning hover:underline font-mono flex items-center gap-1 transition-colors"
+                      className="text-xs text-lightning hover:underline font-mono flex items-center gap-1 transition-colors min-h-[32px] px-2 py-1"
+                      aria-label={copyFeedback === "success" ? "Invoice copied to clipboard" : "Copy BOLT11 invoice"}
                     >
                       {copyFeedback === "success" ? (
                         <>
-                          <Check className="w-3.5 h-3.5 text-success" />
-                          <span className="text-success font-semibold">Copied!</span>
+                          <Check className="w-3.5 h-3.5 text-success" aria-hidden="true" />
+                          <span className="text-success font-semibold" role="status" aria-live="polite">Copied!</span>
                         </>
                       ) : copyFeedback === "error" ? (
                         <>
-                          <AlertCircle className="w-3.5 h-3.5 text-destructive" />
-                          <span className="text-destructive font-semibold">Copy failed</span>
+                          <AlertCircle className="w-3.5 h-3.5 text-destructive" aria-hidden="true" />
+                          <span className="text-destructive font-semibold" role="alert" aria-live="assertive">Copy failed</span>
                         </>
                       ) : (
                         <>
-                          <Copy className="w-3.5 h-3.5" />
+                          <Copy className="w-3.5 h-3.5" aria-hidden="true" />
                           <span>Copy Invoice</span>
                         </>
                       )}
@@ -603,12 +672,75 @@ export function ChatPanel({
                 </div>
                 <div className={`flex flex-col gap-1 mt-1 ${msg.role === "user" ? "items-end" : ""}`}>
                   <span className="font-medium text-sm">{msg.role === "user" ? "You" : "SatsGrid"}</span>
-                  <div className={`leading-relaxed ${msg.role === "user" ? "bg-muted px-4 py-2 rounded-2xl rounded-tr-sm" : "text-foreground whitespace-pre-wrap"}`}>
+                  <div
+                    className={`leading-relaxed ${msg.role === "user" ? "bg-muted px-4 py-2 rounded-2xl rounded-tr-sm" : "text-foreground whitespace-pre-wrap"}`}
+                    role={msg.role === "assistant" && isStreaming && i === messages.length - 1 ? "status" : undefined}
+                    aria-live={msg.role === "assistant" && isStreaming && i === messages.length - 1 ? "polite" : undefined}
+                  >
                     {msg.content}
                     {isStreaming && i === messages.length - 1 && msg.role === "assistant" && (
-                      <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" />
+                      <span className="inline-block w-2 h-4 bg-primary animate-pulse ml-1 align-middle" aria-hidden="true" />
                     )}
                   </div>
+                  {msg.role === "assistant" && (
+                    <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                      {isSpeechSynthSupported && !isStreaming && (
+                        <button
+                          onClick={() => {
+                            if (isSpeaking && activeSpeechMessageIndex === i) {
+                              stopSpeaking();
+                              setActiveSpeechMessageIndex(null);
+                            } else {
+                              setActiveSpeechMessageIndex(i);
+                              speak(msg.content);
+                            }
+                          }}
+                          className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full transition-colors cursor-pointer border ${
+                            isSpeaking && activeSpeechMessageIndex === i
+                              ? "bg-primary text-primary-foreground border-primary animate-pulse"
+                              : "bg-secondary text-secondary-foreground hover:bg-secondary/80 border-border/50"
+                          }`}
+                          aria-label={
+                            isSpeaking && activeSpeechMessageIndex === i
+                              ? "Stop reading response aloud"
+                              : "Read response aloud"
+                          }
+                          title={
+                            isSpeaking && activeSpeechMessageIndex === i
+                              ? "Stop reading aloud"
+                              : "Read response aloud"
+                          }
+                        >
+                          {isSpeaking && activeSpeechMessageIndex === i ? (
+                            <>
+                              <Square className="w-3 h-3 fill-current" />
+                              <span>Stop reading</span>
+                            </>
+                          ) : (
+                            <>
+                              <Volume2 className="w-3 h-3" />
+                              <span>Read aloud</span>
+                            </>
+                          )}
+                        </button>
+                      )}
+
+                      {msg.receipt_id && (
+                        <button
+                          onClick={() => {
+                            setSelectedReceiptId(msg.receipt_id!);
+                            setIsReceiptDialogOpen(true);
+                          }}
+                          className="inline-flex items-center gap-1 text-[11px] font-medium text-primary bg-primary/10 hover:bg-primary/15 border border-primary/20 px-2 py-0.5 rounded-full transition-colors cursor-pointer"
+                          title={`Inspect signed receipt ${msg.receipt_id}`}
+                          aria-label={`Inspect signed receipt ${msg.receipt_id}`}
+                        >
+                          <ShieldCheck className="w-3 h-3 text-primary" />
+                          <span>Signed Receipt: <span className="font-mono">{msg.receipt_id.slice(0, 14)}...</span></span>
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -616,41 +748,151 @@ export function ChatPanel({
         )}
       </div>
 
+      <ReceiptDialog
+        receiptId={selectedReceiptId}
+        open={isReceiptDialogOpen}
+        onOpenChange={setIsReceiptDialogOpen}
+      />
+
       {/* Input Area */}
       <div className="p-4 bg-background border-t border-border/40">
         <div className="max-w-3xl mx-auto relative rounded-xl border border-border bg-card shadow-sm focus-within:ring-1 focus-within:ring-ring">
+          <label htmlFor="playground-chat-input" className="sr-only">
+            Chat message input
+          </label>
           <Textarea 
+            id="playground-chat-input"
+            aria-label="Chat message input"
+            aria-describedby="playground-privacy-notice"
             placeholder={
               sessionStatus === "closed"
                 ? "This session is closed. Start a new session to continue chatting."
                 : isInputDisabled
                 ? "Awaiting active session..."
-                : "Send a message..."
+                : "Send a message (press Enter to send)..."
             }
             disabled={isInputDisabled}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            className="min-h-[80px] w-full resize-none border-0 bg-transparent py-4 pl-4 pr-14 focus-visible:ring-0 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed"
+            className="min-h-[80px] w-full resize-none border-0 bg-transparent py-4 pl-4 pr-24 focus-visible:ring-0 rounded-xl disabled:opacity-50 disabled:cursor-not-allowed text-sm"
           />
-          <Button 
-            size="icon" 
-            onClick={handleSend}
-            className="absolute right-3 bottom-3 h-8 w-8 rounded-md"
-            disabled={isInputDisabled || !input.trim()}
-          >
-            <Send className="w-4 h-4" />
-          </Button>
+
+          <div className="absolute right-3 bottom-3 flex items-center gap-1.5">
+            {/* Microphone Voice Input Button */}
+            {isSpeechRecSupported ? (
+              <Button
+                type="button"
+                size="icon"
+                variant={speechRecState === "listening" ? "destructive" : "ghost"}
+                onClick={() => {
+                  if (speechRecState === "listening") {
+                    stopListening();
+                  } else {
+                    startListening();
+                  }
+                }}
+                disabled={isInputDisabled}
+                className={`h-8 w-8 rounded-md transition-all ${
+                  speechRecState === "listening" ? "animate-pulse ring-2 ring-destructive/50" : ""
+                }`}
+                aria-label={
+                  speechRecState === "listening"
+                    ? "Stop voice input listening"
+                    : "Start voice input dictation"
+                }
+                title={
+                  speechRecState === "listening"
+                    ? "Listening... Click to stop"
+                    : "Dictate message with voice"
+                }
+              >
+                {speechRecState === "listening" ? (
+                  <MicOff className="w-4 h-4 text-destructive-foreground" />
+                ) : (
+                  <Mic className="w-4 h-4 text-muted-foreground hover:text-foreground" />
+                )}
+              </Button>
+            ) : null}
+
+            {/* Send Button */}
+            <Button 
+              size="icon" 
+              onClick={handleSend}
+              className="h-8 w-8 rounded-md min-h-[32px] min-w-[32px]"
+              disabled={isInputDisabled || !input.trim()}
+              aria-label="Send message"
+              title="Send message"
+            >
+              <Send className="w-4 h-4" />
+            </Button>
+          </div>
         </div>
+
+        {/* Real-time Pre-Request Cost Estimator Banner */}
+        <div className="max-w-3xl mx-auto mt-2 flex flex-wrap items-center justify-between gap-2 px-1 text-[11px] text-muted-foreground">
+          <div className="flex items-center gap-2">
+            <span className="flex items-center gap-1 font-mono">
+              <span className="text-foreground font-medium">Est. Cost:</span>{" "}
+              <span className="text-primary font-semibold">~{costEstimate.minEstimatedSats} sats</span>
+            </span>
+            <span className="text-border">·</span>
+            <span className="font-mono">
+              {costEstimate.estimatedPromptTokens} prompt tokens
+            </span>
+            {costEstimate.rates.isModelSpecific ? (
+              <span className="text-[10px] px-1.5 py-0.2 rounded bg-primary/10 text-primary border border-primary/20 font-medium">
+                Model Pricing
+              </span>
+            ) : (
+              <span className="text-[10px] text-muted-foreground/80">
+                (Base fee: {costEstimate.rates.flatRateSats} sats)
+              </span>
+            )}
+          </div>
+          <span className="text-[10px] text-muted-foreground/60 italic" title="Final charge is determined by exact token generation and recorded in the signed inference receipt">
+            Hold estimate · Actual charge signed on receipt
+          </span>
+        </div>
+
+        {/* Voice Recognition Status Feedback */}
+        {speechRecState === "listening" && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="max-w-3xl mx-auto mt-2 flex items-center justify-between text-xs text-primary bg-primary/10 border border-primary/20 px-3 py-1.5 rounded-lg"
+          >
+            <div className="flex items-center gap-2">
+              <span className="w-2 h-2 rounded-full bg-primary animate-ping" />
+              <span>Listening to your voice... (Text will appear above. You must click Send to submit)</span>
+            </div>
+            <button
+              onClick={stopListening}
+              className="text-[11px] underline hover:no-underline font-medium cursor-pointer"
+            >
+              Stop
+            </button>
+          </div>
+        )}
+
+        {speechRecError && (
+          <div
+            role="alert"
+            aria-live="assertive"
+            className="max-w-3xl mx-auto mt-2 text-xs text-destructive bg-destructive/10 border border-destructive/20 px-3 py-1.5 rounded-lg"
+          >
+            {speechRecError}
+          </div>
+        )}
         
         {/* Privacy Indicator */}
-        <div className="flex flex-col items-center justify-center mt-3 gap-1">
+        <div id="playground-privacy-notice" className="flex flex-col items-center justify-center mt-3 gap-1">
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
-            <Lock className="w-3 h-3" />
+            <Lock className="w-3 h-3" aria-hidden="true" />
             <span className="font-medium">Privacy by default</span>
           </div>
-          <p className="text-[10px] text-muted-foreground/60 uppercase tracking-wider">
-            No account · No API key · Prompts are not logged
+          <p className="text-[10px] text-muted-foreground/60 uppercase tracking-wider text-center">
+            No account · No API key · Prompts are not logged · Voice dictation never auto-submits
           </p>
         </div>
       </div>

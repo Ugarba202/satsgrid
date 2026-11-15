@@ -328,6 +328,33 @@ pub const MIGRATIONS: &[Migration] = &[
         "#,
         requires_foreign_keys_disabled: false,
     },
+    Migration {
+        version: 13,
+        name: "create_provider_registry",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS providers (
+            pubkey TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            models TEXT NOT NULL,
+            pricing_sats INTEGER NOT NULL,
+            network TEXT NOT NULL,
+            version TEXT NOT NULL,
+            receipt_key_id TEXT,
+            status TEXT NOT NULL DEFAULT 'discovered' CHECK (status IN ('discovered', 'reachable', 'healthy', 'offline', 'error')),
+            last_seen_at INTEGER NOT NULL,
+            last_checked_at INTEGER,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_providers_status ON providers(status);
+        CREATE INDEX IF NOT EXISTS idx_providers_network ON providers(network);
+        CREATE INDEX IF NOT EXISTS idx_providers_last_seen ON providers(last_seen_at);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
 ];
 
 /// Execute pending migrations against the SQLite pool in an atomic transaction.

@@ -3,6 +3,7 @@ pub mod invoice;
 pub mod migrations;
 pub mod model;
 pub mod payment;
+pub mod provider;
 pub mod receipt;
 pub mod reconciliation;
 pub mod request;
@@ -14,6 +15,7 @@ pub use invoice::{
 };
 pub use model::{DiscoveredModel, ModelRecord, ModelStore};
 pub use payment::{PaymentAuthState, PaymentStore, ReservationResult};
+pub use provider::{ProviderRecord, ProviderStore};
 pub use receipt::ReceiptStore;
 pub use reconciliation::{
     ReconciliationItemRecord, ReconciliationItemType, ReconciliationStatus, ReconciliationStore,

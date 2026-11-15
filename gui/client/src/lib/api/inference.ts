@@ -37,7 +37,8 @@ export async function streamChatCompletion(
   onChargedSats?: (sats: number) => void,
   onRemainingBudget?: (sats: number) => void,
   onAuthorized?: () => void,
-  onCompleted?: () => void | Promise<void>
+  onCompleted?: () => void | Promise<void>,
+  onReceiptId?: (receiptId: string) => void
 ): Promise<void> {
   const res = await fetch("/v1/chat/completions", {
     method: "POST",
@@ -60,13 +61,20 @@ export async function streamChatCompletion(
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
+  let currentEventType = "";
   let eventData: string[] = [];
   let done = false;
 
   const dispatchEvent = () => {
-    if (eventData.length === 0) return;
+    if (eventData.length === 0) {
+      currentEventType = "";
+      return;
+    }
     const dataText = eventData.join("\n");
+    const eventType = currentEventType;
     eventData = [];
+    currentEventType = "";
+
     if (dataText.trim() === "[DONE]") {
       done = true;
       return;
@@ -74,12 +82,24 @@ export async function streamChatCompletion(
     let data: {
       choices?: Array<{ delta?: { content?: unknown } }>;
       error?: { message?: unknown };
+      receipt_id?: unknown;
     };
     try {
       data = JSON.parse(dataText) as typeof data;
     } catch {
       return;
     }
+
+    if (typeof data?.receipt_id === "string" && data.receipt_id.trim().length > 0) {
+      onReceiptId?.(data.receipt_id.trim());
+    } else if (eventType === "receipt") {
+      // In case receipt_id was formatted differently in event payload
+      const possibleId = (data as Record<string, unknown>)?.receipt_id || (data as Record<string, unknown>)?.id;
+      if (typeof possibleId === "string" && possibleId.trim().length > 0) {
+        onReceiptId?.(possibleId.trim());
+      }
+    }
+
     const content = data?.choices?.[0]?.delta?.content;
     if (typeof content === "string" && content.length > 0) onChunk(content);
     const errorMessage = data.error?.message;
@@ -94,6 +114,8 @@ export async function streamChatCompletion(
       const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
       if (line === "") {
         dispatchEvent();
+      } else if (line.startsWith("event:")) {
+        currentEventType = line.slice(6).trim();
       } else if (line.startsWith("data:")) {
         eventData.push(line.slice(5).replace(/^ /, ""));
       }
@@ -122,7 +144,8 @@ export async function chatCompletion(
   request: ChatCompletionRequest,
   macaroon: string,
   preimage: string,
-  refreshSession: () => void | Promise<void>
+  refreshSession: () => void | Promise<void>,
+  onReceiptId?: (receiptId: string) => void
 ): Promise<unknown> {
   const res = await fetch("/v1/chat/completions", {
     method: "POST",
@@ -133,6 +156,10 @@ export async function chatCompletion(
     body: JSON.stringify({ ...request, stream: false }),
   });
   if (!res.ok) throw await responseError(res, [macaroon, preimage]);
+  const receiptId = res.headers.get("x-satsgrid-receipt-id");
+  if (receiptId && receiptId.trim().length > 0) {
+    onReceiptId?.(receiptId.trim());
+  }
   const result = await res.json();
   await refreshSession();
   return result;

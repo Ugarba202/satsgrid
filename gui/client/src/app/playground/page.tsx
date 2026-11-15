@@ -11,6 +11,7 @@ import { streamChatCompletion } from "@/lib/api/inference";
 import { InferenceRequestError } from "@/lib/api/inference";
 import { Message } from "@/types/inference";
 import { attachPaymentProof, inferenceFailureStatus, markBackendConfirmed, recoverySession, restoredStatus, sessionFromChallenge, walletFailureStatus, type RecoveryCredentials } from "@/lib/session-lifecycle";
+import { useSpokenAnnouncements } from "@/lib/speech/useSpokenAnnouncements";
 import { 
   saveStoredSession, 
   updateStoredSessionBudget, 
@@ -31,6 +32,12 @@ export default function PlaygroundPage() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
   const [balanceSyncStatus, setBalanceSyncStatus] = useState<"syncing" | "confirmed" | "unavailable">("unavailable");
+  const [voiceAnnouncementsEnabled, setVoiceAnnouncementsEnabled] = useState(false);
+
+  // Spoken Confirmation System
+  const { announce } = useSpokenAnnouncements({
+    enabled: voiceAnnouncementsEnabled,
+  });
 
   const synchronizeSession = useCallback(async (stored: StoredSession) => {
     if (!stored.preimage || !stored.macaroon) {
@@ -174,6 +181,7 @@ export default function PlaygroundPage() {
         }
         setActiveSessionId(pending.id);
         setSessionStatus("payment_required");
+        announce("invoice_issued");
         setSessionData((prev) => ({
           ...prev,
           invoice: pending.invoice,
@@ -308,6 +316,7 @@ export default function PlaygroundPage() {
       setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
       let accumulatedContent = "";
+      let capturedReceiptId: string | undefined = undefined;
 
       await streamChatCompletion(
         {
@@ -322,7 +331,11 @@ export default function PlaygroundPage() {
             const updated = [...prev];
             const last = updated[updated.length - 1];
             if (last && last.role === "assistant") {
-              updated[updated.length - 1] = { ...last, content: last.content + chunk };
+              updated[updated.length - 1] = {
+                ...last,
+                content: last.content + chunk,
+                receipt_id: capturedReceiptId ?? last.receipt_id,
+              };
             }
             return updated;
           });
@@ -354,6 +367,8 @@ export default function PlaygroundPage() {
         },
         () => {
           backendConfirmed = true;
+          // Authoritative payment security rule: announce payment confirmation ONLY when backend authorizes
+          announce("payment_confirmed");
           const id = sessionData.id;
           if (!id) return;
           const stored = getStoredSessionById(id);
@@ -366,20 +381,41 @@ export default function PlaygroundPage() {
           if (confirmed) setErrorMessage(null);
         },
         async () => {
+          announce("inference_completed");
           if (!sessionData.id) return;
           const stored = getStoredSessionById(sessionData.id);
           if (stored) await synchronizeSession(stored);
+        },
+        (receiptId) => {
+          capturedReceiptId = receiptId;
+          announce("receipt_available");
+          setMessages((prev) => {
+            const updated = [...prev];
+            const last = updated[updated.length - 1];
+            if (last && last.role === "assistant") {
+              updated[updated.length - 1] = { ...last, receipt_id: receiptId };
+            }
+            return updated;
+          });
         }
       );
 
       // Persist completed conversation
       if (sessionData.id) {
-        const finalized = [...newMessages, { role: "assistant" as const, content: accumulatedContent }];
+        const finalized = [
+          ...newMessages,
+          {
+            role: "assistant" as const,
+            content: accumulatedContent,
+            receipt_id: capturedReceiptId,
+          },
+        ];
         updateStoredSessionMessages(sessionData.id, finalized);
       }
     } catch (e) {
       const message = e instanceof Error ? e.message : "Inference request failed.";
       setErrorMessage(message);
+      announce("inference_failed", "Check the displayed error message.");
       if (backendConfirmed) {
         setSessionStatus(observedRemaining <= 0 ? "exhausted" : "active");
       } else {
@@ -430,6 +466,8 @@ export default function PlaygroundPage() {
             sessionData={sessionData}
             balanceSyncStatus={balanceSyncStatus}
             errorMessage={errorMessage}
+            voiceAnnouncementsEnabled={voiceAnnouncementsEnabled}
+            onToggleVoiceAnnouncements={setVoiceAnnouncementsEnabled}
             onBudgetChange={handleBudgetChange}
             onStartSession={handleStartSession}
             onResetSession={handleResetSession}

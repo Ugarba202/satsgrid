@@ -10,11 +10,20 @@ export interface NodeHealthResponse {
   lightning?: NodeLightningInfo;
 }
 
+export interface ModelPricing {
+  flat_rate_sats?: number | null;
+  sats_per_prompt_token?: number | null;
+  sats_per_completion_token?: number | null;
+}
+
 export interface ModelEntry {
   id: string;
   object: string;
   created: number;
   owned_by: string;
+  description?: string | null;
+  context_length?: number | null;
+  pricing?: ModelPricing | null;
 }
 
 export interface ReconciliationWorkerStats {
@@ -27,10 +36,32 @@ export interface ReconciliationWorkerStats {
   last_error: string | null;
 }
 
+export interface ModelActivityItem {
+  model: string;
+  completed_requests: number;
+  sats_earned: number;
+}
+
+export interface RecentRequestItem {
+  id: string;
+  model: string;
+  status: string;
+  charged_sats: number;
+  created_at: number;
+}
+
 export interface NodeStatsResponse {
   total_requests: number;
   active_sessions?: number;
   total_sats_earned: number;
+  reserved_sats?: number;
+  requests_breakdown?: {
+    completed: number;
+    failed: number;
+    reconciliation_required: number;
+  };
+  model_breakdown?: ModelActivityItem[];
+  recent_requests?: RecentRequestItem[];
   invoices?: {
     pending: number;
     settled: number;
@@ -142,6 +173,47 @@ export async function updateNodePricing(
     throw new Error(`Update pricing failed: ${res.status}`);
   }
   return res.json();
+}
+
+export interface DiscoveredProvider {
+  pubkey: string;
+  name: string;
+  endpoint: string;
+  models: string[];
+  pricing_sats: number;
+  network: string;
+  version: string;
+  receipt_key_id?: string | null;
+  status: "discovered" | "reachable" | "healthy" | "offline" | "error";
+  last_seen_at: number;
+  last_checked_at?: number | null;
+  last_error?: string | null;
+}
+
+export interface ProviderListResponse {
+  providers: DiscoveredProvider[];
+  count: number;
+}
+
+export async function fetchProviders(): Promise<DiscoveredProvider[]> {
+  try {
+    const res = await fetch("/v1/providers", { cache: "no-store" });
+    if (!res.ok) return [];
+    const data: ProviderListResponse = await res.json();
+    return data.providers || [];
+  } catch {
+    return [];
+  }
+}
+
+export async function fetchProvider(pubkey: string): Promise<DiscoveredProvider | null> {
+  try {
+    const res = await fetch(`/v1/providers/${encodeURIComponent(pubkey)}`, { cache: "no-store" });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchReconciliationItems(

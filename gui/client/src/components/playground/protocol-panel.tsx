@@ -17,6 +17,8 @@ interface ProtocolPanelProps {
   sessionData: SessionData;
   balanceSyncStatus?: "syncing" | "confirmed" | "unavailable";
   errorMessage?: string | null;
+  voiceAnnouncementsEnabled?: boolean;
+  onToggleVoiceAnnouncements?: (enabled: boolean) => void;
   onBudgetChange?: (budget: number) => void;
   onStartSession: () => void;
   onResetSession?: () => void;
@@ -28,6 +30,8 @@ export function ProtocolPanel({
   sessionData,
   balanceSyncStatus = "confirmed",
   errorMessage,
+  voiceAnnouncementsEnabled = false,
+  onToggleVoiceAnnouncements,
   onBudgetChange,
   onStartSession,
   onResetSession,
@@ -85,8 +89,20 @@ export function ProtocolPanel({
 
   return (
     <div className="flex flex-col h-full">
-      <div className="h-14 border-b border-border/40 flex items-center px-4 bg-card/50 sticky top-0 z-10">
+      <div className="h-14 border-b border-border/40 flex items-center justify-between px-4 bg-card/50 sticky top-0 z-10">
         <h2 className="font-semibold text-sm">Protocol Activity</h2>
+        {onToggleVoiceAnnouncements && (
+          <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={voiceAnnouncementsEnabled}
+              onChange={(e) => onToggleVoiceAnnouncements(e.target.checked)}
+              className="rounded border-border text-primary focus:ring-1 focus:ring-primary w-3.5 h-3.5"
+              aria-label="Toggle spoken voice announcements"
+            />
+            <span className="text-[11px] font-medium">Spoken Confirmations</span>
+          </label>
+        )}
       </div>
 
       <div className="p-4 flex flex-col gap-6">

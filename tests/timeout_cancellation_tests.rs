@@ -589,7 +589,10 @@ async fn test_successful_stream_persists_one_verifiable_signed_receipt() {
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("[DONE]"));
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(body_str.contains("[DONE]"));
+    assert!(body_str.contains("event: receipt"));
+    assert!(body_str.contains("receipt_id"));
 
     let request = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -653,6 +656,14 @@ async fn test_successful_stream_persists_one_verifiable_signed_receipt() {
     assert_eq!(receipt.payload.inference_status, "completed");
     assert_eq!(receipt.algorithm, ED25519_ALGORITHM_NAME);
     ReceiptSigner::verify_signature(&receipt, None).expect("verify streaming receipt signature");
+
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(body_str.contains("event: receipt"));
+    assert!(body_str.contains(&format!(
+        "\"receipt_id\":\"{}\"",
+        receipt.payload.receipt_id
+    )));
+    assert!(body_str.contains("data: [DONE]"));
 
     // Replaying the successful completion callback must remain idempotent.
     ctx.db
@@ -868,7 +879,10 @@ async fn test_stream_receipt_persistence_failure_is_durably_recoverable() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("[DONE]"));
+    let body_str = String::from_utf8_lossy(&body);
+    assert!(body_str.contains("[DONE]"));
+    assert!(!body_str.contains("event: receipt"));
+    assert!(!body_str.contains("receipt_id"));
 
     let request = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -1044,6 +1058,253 @@ async fn test_atomic_non_streaming_finalization_consistency() {
         res_count, 0,
         "No active reserved reservations should remain"
     );
+}
+
+#[tokio::test]
+async fn test_successful_non_streaming_persists_receipt_and_returns_header() {
+    use satsgrid::node::receipt::{ReceiptSigner, ED25519_ALGORITHM_NAME};
+
+    let ctx = setup_test_context(UpstreamConfig::default()).await;
+    let signer = Arc::new(
+        ReceiptSigner::load_or_generate(ctx._dir.path(), "satsgrid-node").expect("signer"),
+    );
+    AppState::set_receipt_signer(signer.clone());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cmpl_receipt_success",
+            "choices": [{"message": {"role": "assistant", "content": "Receipt success"}}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 24, "total_tokens": 36}
+        })))
+        .mount(&ctx.mock_server)
+        .await;
+
+    let session_uuid = uuid::Uuid::new_v4();
+    let session_id = SessionId(session_uuid);
+    let invoice = ctx
+        .lightning
+        .create_invoice(Satoshis(100), "Non-streaming receipt test")
+        .await
+        .unwrap();
+    let preimage = ctx.lightning.pay_invoice(&invoice.bolt11).await.unwrap();
+    ctx.budget_manager
+        .open_session_with_details(
+            &session_id,
+            Some(&invoice.payment_hash),
+            Satoshis(100),
+            chrono::Utc::now().timestamp() + 3600,
+        )
+        .await
+        .unwrap();
+
+    let macaroon = ctx
+        .macaroon_service
+        .mint(
+            &invoice.payment_hash,
+            vec![
+                Caveat::Session(session_uuid.to_string()),
+                Caveat::Budget(100),
+                Caveat::Capability("inference".to_string()),
+                Caveat::ExpiresAt((chrono::Utc::now().timestamp() + 3600) as u64),
+                Caveat::Model("llama3.2".to_string()),
+            ],
+        )
+        .unwrap();
+
+    let auth_header = format!("L402 {}:{}", macaroon.to_base64().unwrap(), preimage);
+
+    let payload = json!({
+        "model": "llama3.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, &auth_header)
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = ctx.app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify response header contains receipt ID
+    let receipt_id_header = resp
+        .headers()
+        .get("x-satsgrid-receipt-id")
+        .expect("x-satsgrid-receipt-id header must be present on success");
+    let receipt_id_str = receipt_id_header.to_str().unwrap().to_string();
+    assert!(receipt_id_str.starts_with("rcpt_"));
+
+    // Verify receipt retrieval returns the persisted receipt
+    let receipt = ctx
+        .db
+        .receipt_store()
+        .get_receipt(&receipt_id_str)
+        .await
+        .unwrap()
+        .expect("receipt must be persisted in database");
+    assert_eq!(receipt.payload.receipt_id, receipt_id_str);
+    assert_eq!(receipt.payload.inference_status, "completed");
+    assert_eq!(receipt.payload.payment_status, "settled");
+    assert_eq!(receipt.algorithm, ED25519_ALGORITHM_NAME);
+    assert_eq!(receipt.payload.prompt_tokens, Some(12));
+    assert_eq!(receipt.payload.completion_tokens, Some(24));
+
+    // Verify cryptographic signature
+    let active_signer = AppState::receipt_signer().expect("active receipt signer");
+    ReceiptSigner::verify_signature(&receipt, None).expect("verify receipt signature embedded key");
+    ReceiptSigner::verify_signature(&receipt, Some(active_signer.public_key_hex()))
+        .expect("verify receipt signature trusted key");
+
+    // Exactly one receipt persisted
+    let receipt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM receipts WHERE id = ?1")
+        .bind(&receipt_id_str)
+        .fetch_one(ctx.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipt_count, 1);
+
+    // Verify session accounting
+    let session = ctx
+        .db
+        .session_store()
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.remaining_sats, Satoshis(90));
+    assert_eq!(session.reserved_sats, Satoshis(0));
+    assert_eq!(session.spent_sats, Satoshis(10));
+}
+
+#[tokio::test]
+async fn test_non_streaming_receipt_persistence_failure_does_not_return_receipt_header_and_preserves_accounting(
+) {
+    use satsgrid::node::receipt::ReceiptSigner;
+
+    let ctx = setup_test_context(UpstreamConfig::default()).await;
+    let signer = Arc::new(
+        ReceiptSigner::load_or_generate(ctx._dir.path(), "satsgrid-node").expect("signer"),
+    );
+    AppState::set_receipt_signer(signer);
+
+    // Injected receipt persistence failure trigger
+    sqlx::query(
+        "CREATE TRIGGER reject_non_streaming_receipt BEFORE INSERT ON receipts BEGIN SELECT RAISE(FAIL, 'injected receipt persistence failure'); END",
+    )
+    .execute(ctx.db.pool())
+    .await
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cmpl_receipt_failure",
+            "choices": [{"message": {"role": "assistant", "content": "Receipt failure test"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+        })))
+        .mount(&ctx.mock_server)
+        .await;
+
+    let session_uuid = uuid::Uuid::new_v4();
+    let session_id = SessionId(session_uuid);
+    let invoice = ctx
+        .lightning
+        .create_invoice(Satoshis(100), "Receipt persistence failure test")
+        .await
+        .unwrap();
+    let preimage = ctx.lightning.pay_invoice(&invoice.bolt11).await.unwrap();
+    ctx.budget_manager
+        .open_session_with_details(
+            &session_id,
+            Some(&invoice.payment_hash),
+            Satoshis(100),
+            chrono::Utc::now().timestamp() + 3600,
+        )
+        .await
+        .unwrap();
+
+    let macaroon = ctx
+        .macaroon_service
+        .mint(
+            &invoice.payment_hash,
+            vec![
+                Caveat::Session(session_uuid.to_string()),
+                Caveat::Budget(100),
+                Caveat::Capability("inference".to_string()),
+                Caveat::ExpiresAt((chrono::Utc::now().timestamp() + 3600) as u64),
+                Caveat::Model("llama3.2".to_string()),
+            ],
+        )
+        .unwrap();
+
+    let auth_header = format!("L402 {}:{}", macaroon.to_base64().unwrap(), preimage);
+
+    let payload = json!({
+        "model": "llama3.2",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": false
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, &auth_header)
+        .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+        .unwrap();
+
+    let resp = ctx.app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // CRITICAL: x-satsgrid-receipt-id header MUST NOT be present when persistence failed!
+    assert!(
+        resp.headers().get("x-satsgrid-receipt-id").is_none(),
+        "x-satsgrid-receipt-id must NOT be returned when persistence fails"
+    );
+
+    // Verify response body still delivered the assistant response to client
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(
+        body_json["choices"][0]["message"]["content"],
+        "Receipt failure test"
+    );
+
+    // Verify no receipts were persisted in database
+    let total_receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM receipts")
+        .fetch_one(ctx.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(total_receipts, 0);
+
+    // Verify session accounting invariants: exactly one debit of 10 sats occurred
+    let session = ctx
+        .db
+        .session_store()
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.remaining_sats, Satoshis(90));
+    assert_eq!(session.reserved_sats, Satoshis(0));
+    assert_eq!(session.spent_sats, Satoshis(10));
+
+    // Verify no duplicate debits occurred
+    let debit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM accounting_entries WHERE session_id = ?1 AND entry_type = 'session_debit'",
+    )
+    .bind(session_id.0.to_string())
+    .fetch_one(ctx.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(debit_count, 1, "Exactly one debit entry must exist");
 }
 
 #[tokio::test]
@@ -1269,4 +1530,174 @@ async fn test_streaming_total_deadline_terminates_active_chunks() {
         req_record.error_code,
         Some("stream_total_timeout".to_string())
     );
+}
+
+#[tokio::test]
+async fn test_streaming_receipt_delivery_and_openai_client_compatibility() {
+    use satsgrid::node::receipt::{ReceiptSigner, ED25519_ALGORITHM_NAME};
+
+    let ctx = setup_test_context(UpstreamConfig::default()).await;
+    let signer = Arc::new(
+        ReceiptSigner::load_or_generate(ctx._dir.path(), "satsgrid-node").expect("signer"),
+    );
+    AppState::set_receipt_signer(signer.clone());
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"world!\"}}]}\n\ndata: [DONE]\n\n",
+                ),
+        )
+        .mount(&ctx.mock_server)
+        .await;
+
+    let session_uuid = uuid::Uuid::new_v4();
+    let session_id = SessionId(session_uuid);
+    let invoice = ctx
+        .lightning
+        .create_invoice(Satoshis(100), "Streaming receipt test")
+        .await
+        .unwrap();
+    let preimage = ctx.lightning.pay_invoice(&invoice.bolt11).await.unwrap();
+    ctx.budget_manager
+        .open_session_with_details(
+            &session_id,
+            Some(&invoice.payment_hash),
+            Satoshis(100),
+            chrono::Utc::now().timestamp() + 3600,
+        )
+        .await
+        .unwrap();
+
+    let macaroon = ctx
+        .macaroon_service
+        .mint(
+            &invoice.payment_hash,
+            vec![
+                Caveat::Session(session_uuid.to_string()),
+                Caveat::Budget(100),
+                Caveat::Capability("inference".to_string()),
+                Caveat::ExpiresAt((chrono::Utc::now().timestamp() + 3600) as u64),
+                Caveat::Model("llama3.2".to_string()),
+            ],
+        )
+        .unwrap();
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(
+            header::AUTHORIZATION,
+            format!("L402 {}:{}", macaroon.to_base64().unwrap(), preimage),
+        )
+        .body(Body::from(
+            json!({
+                "model": "llama3.2",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": true
+            })
+            .to_string(),
+        ))
+        .unwrap();
+
+    let response = ctx.app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    // 1. Simulate an OpenAI-compatible client parsing the SSE stream
+    let mut accumulated_text = String::new();
+    let mut captured_receipt_id: Option<String> = None;
+    let mut saw_done = false;
+
+    for chunk in body_str.split("\n\n") {
+        let trimmed = chunk.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lines: Vec<&str> = trimmed.lines().map(|l| l.trim()).collect();
+        let mut data_str: Option<&str> = None;
+
+        for line in lines {
+            if let Some(rest) = line.strip_prefix("data:") {
+                data_str = Some(rest.trim());
+            }
+        }
+
+        if let Some(data) = data_str {
+            if data == "[DONE]" {
+                saw_done = true;
+                break;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                // Check if chunk has delta content
+                if let Some(content) = v
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c0| c0.get("delta"))
+                    .and_then(|d| d.get("content"))
+                    .and_then(|s| s.as_str())
+                {
+                    accumulated_text.push_str(content);
+                }
+                // Check if chunk exposes receipt_id
+                if let Some(rcpt) = v.get("receipt_id").and_then(|s| s.as_str()) {
+                    captured_receipt_id = Some(rcpt.to_string());
+                }
+            }
+        }
+    }
+
+    assert!(saw_done, "Stream must terminate with [DONE]");
+    assert_eq!(
+        accumulated_text, "Hello world!",
+        "OpenAI client must accumulate all tokens"
+    );
+    assert!(
+        captured_receipt_id.is_some(),
+        "Stream must deliver receipt_id"
+    );
+
+    let receipt_id = captured_receipt_id.unwrap();
+    assert!(receipt_id.starts_with("rcpt_"));
+
+    // 2. Fetch and cryptographically verify the emitted receipt ID
+    let receipt = ctx
+        .db
+        .receipt_store()
+        .get_receipt(&receipt_id)
+        .await
+        .unwrap()
+        .expect("receipt must exist in store");
+    assert_eq!(receipt.payload.receipt_id, receipt_id);
+    assert_eq!(receipt.payload.inference_status, "completed");
+    assert_eq!(receipt.payload.payment_status, "settled");
+    assert_eq!(receipt.algorithm, ED25519_ALGORITHM_NAME);
+    ReceiptSigner::verify_signature(&receipt, None).expect("verify receipt signature");
+
+    // Exactly one receipt persisted
+    let receipt_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM receipts WHERE id = ?1")
+        .bind(&receipt_id)
+        .fetch_one(ctx.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(receipt_count, 1);
+
+    // Invariant check: exactly one session debit
+    let session = ctx
+        .db
+        .session_store()
+        .get_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.remaining_sats, Satoshis(90));
+    assert_eq!(session.reserved_sats, Satoshis(0));
+    assert_eq!(session.spent_sats, Satoshis(10));
 }

@@ -20,6 +20,10 @@ import {
   Clock,
   HelpCircle,
   FileText,
+  CheckCircle2,
+  XCircle,
+  Hourglass,
+  Layers,
 } from "lucide-react";
 import { StatusBadge } from "@/components/satsgrid/status-badge";
 import {
@@ -77,8 +81,12 @@ export default function NodeDashboardPage() {
       const res = await fetchReconciliationItems(token);
       setReconItems(res.items || []);
     } catch (err: any) {
-      console.error("Failed to fetch reconciliation items:", err);
-      setReconError(err.message || "Failed to load reconciliation records");
+      if (err.message && err.message.includes("401")) {
+        setAuthError("Unauthorized or invalid admin token.");
+        setReconItems([]);
+      } else {
+        setReconError(err.message || "Failed to load reconciliation records");
+      }
     } finally {
       setIsReconLoading(false);
     }
@@ -196,7 +204,7 @@ export default function NodeDashboardPage() {
           </div>
         </div>
 
-        {/* Top 4 Metrics Cards */}
+        {/* Top Operational & Accounting Metrics Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {/* Node Status */}
           <Card className="p-4 flex flex-col gap-2 bg-card">
@@ -262,17 +270,17 @@ export default function NodeDashboardPage() {
             )}
           </Card>
 
-          {/* Sats Earned / Lightning Backend */}
+          {/* Sats Earned / Settled Revenue */}
           <Card className="p-4 flex flex-col gap-2 bg-card">
             <div className="flex items-center gap-2 text-muted-foreground mb-2">
               <Coins className="w-4 h-4 text-lightning" />
-              <span className="text-xs uppercase tracking-wider font-semibold">Total Revenue</span>
+              <span className="text-xs uppercase tracking-wider font-semibold">Settled Revenue</span>
             </div>
             {stats ? (
               <div>
                 <span className="text-2xl font-bold text-lightning">{stats.total_sats_earned} SATS</span>
                 <div className="text-xs text-muted-foreground mt-1">
-                  Settled via {config?.lightning?.backend?.toUpperCase() || health?.lightning?.backend?.toUpperCase() || "Lightning"}
+                  Earned from completed inference ({config?.lightning?.backend?.toUpperCase() || health?.lightning?.backend?.toUpperCase() || "Lightning"})
                 </div>
               </div>
             ) : (
@@ -283,6 +291,104 @@ export default function NodeDashboardPage() {
             )}
           </Card>
         </div>
+
+        {/* Accounting & Request Lifecycle Breakdown (Admin Only) */}
+        {stats && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Active Budget Reservations (Unearned) */}
+            <Card className="p-4 flex flex-col gap-2 bg-card border-amber-500/20">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Hourglass className="w-4 h-4 text-amber-500" />
+                  <span className="text-xs uppercase tracking-wider font-semibold text-foreground">
+                    Active Reservations
+                  </span>
+                </div>
+                <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 border border-amber-500/20">
+                  Unearned Hold
+                </span>
+              </div>
+              <div className="mt-1">
+                <span className="text-2xl font-bold font-mono text-amber-400">
+                  {stats.reserved_sats ?? 0} SATS
+                </span>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Currently escrowed/held for in-flight streaming chunks. Not added to settled revenue until finalization.
+                </p>
+              </div>
+            </Card>
+
+            {/* Request Execution Outcomes */}
+            <Card className="p-4 flex flex-col gap-2 bg-card border-border">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Layers className="w-4 h-4 text-primary" />
+                  <span className="text-xs uppercase tracking-wider font-semibold text-foreground">
+                    Request Outcomes
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono text-muted-foreground">
+                  Durable Lifecycle
+                </span>
+              </div>
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3 text-success" /> Completed
+                  </span>
+                  <span className="text-lg font-bold font-mono text-success mt-0.5">
+                    {stats.requests_breakdown?.completed ?? stats.total_requests}
+                  </span>
+                </div>
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                    <XCircle className="w-3 h-3 text-destructive" /> Failed
+                  </span>
+                  <span className="text-lg font-bold font-mono text-destructive mt-0.5">
+                    {stats.requests_breakdown?.failed ?? 0}
+                  </span>
+                </div>
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 text-amber-400" /> In Recon
+                  </span>
+                  <span className="text-lg font-bold font-mono text-amber-400 mt-0.5">
+                    {stats.requests_breakdown?.reconciliation_required ?? 0}
+                  </span>
+                </div>
+              </div>
+            </Card>
+
+            {/* Lightning Invoices Overview */}
+            <Card className="p-4 flex flex-col gap-2 bg-card border-border">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Coins className="w-4 h-4 text-lightning" />
+                  <span className="text-xs uppercase tracking-wider font-semibold text-foreground">
+                    Lightning Invoices
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono text-muted-foreground">
+                  L402 / Preimage
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground">Settled Invoices</span>
+                  <span className="text-lg font-bold font-mono text-lightning mt-0.5">
+                    {stats.invoices?.settled ?? 0}
+                  </span>
+                </div>
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground">Pending Invoices</span>
+                  <span className="text-lg font-bold font-mono text-foreground mt-0.5">
+                    {stats.invoices?.pending ?? 0}
+                  </span>
+                </div>
+              </div>
+            </Card>
+          </div>
+        )}
 
         {/* Detailed Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -422,8 +528,113 @@ export default function NodeDashboardPage() {
                 </div>
               </div>
             </Card>
+
+            {/* Model Inference Activity & Revenue Breakdown */}
+            {stats && stats.model_breakdown && stats.model_breakdown.length > 0 && (
+              <Card className="p-6 bg-card border border-border flex flex-col gap-4">
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <Cpu className="w-5 h-5 text-primary" />
+                  Model Activity & Revenue
+                </h2>
+                <div className="flex flex-col gap-3">
+                  {stats.model_breakdown.map((item) => (
+                    <div
+                      key={item.model}
+                      className="flex items-center justify-between p-3 rounded-xl border border-border/60 bg-background"
+                    >
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-sm font-medium font-mono">{item.model}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {item.completed_requests} {item.completed_requests === 1 ? "completed call" : "completed calls"}
+                        </span>
+                      </div>
+                      <div className="flex flex-col items-end gap-0.5">
+                        <span className="text-sm font-bold font-mono text-lightning">
+                          {item.sats_earned} SATS
+                        </span>
+                        <span className="text-[10px] text-muted-foreground uppercase">
+                          Settled
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
           </div>
         </div>
+
+        {/* Recent Inference Accounting Log (Admin Only) */}
+        {stats && stats.recent_requests && stats.recent_requests.length > 0 && (
+          <Card className="p-6 bg-card border border-border flex flex-col gap-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-border/40 pb-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0">
+                  <FileText className="w-5 h-5 text-primary" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-semibold text-foreground">Recent Inference Accounting Log</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Persisted execution records and actual charged amounts from the SQLite inference ledger.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto -mx-6 px-6">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-border/60 text-muted-foreground font-mono">
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Status</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Request ID</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Model</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Charged Sats</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Timestamp</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/30">
+                  {stats.recent_requests.map((req) => {
+                    const statusVariant =
+                      req.status === "completed"
+                        ? "success"
+                        : req.status === "reconciliation_required"
+                        ? "warning"
+                        : "destructive";
+                    const createdDate = new Date(req.created_at * 1000).toLocaleString();
+
+                    return (
+                      <tr key={req.id} className="hover:bg-muted/30 transition-colors">
+                        <td className="py-3 px-3">
+                          <StatusBadge variant={statusVariant as any}>
+                            {req.status.replace(/_/g, " ").toUpperCase()}
+                          </StatusBadge>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-foreground">
+                          <span title={req.id} className="cursor-help">
+                            {req.id.length > 16
+                              ? `${req.id.slice(0, 8)}...${req.id.slice(-6)}`
+                              : req.id}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-foreground font-medium">
+                          {req.model}
+                        </td>
+                        <td className="py-3 px-3 font-mono">
+                          <span className={req.status === "completed" ? "text-lightning font-semibold" : "text-muted-foreground"}>
+                            {req.charged_sats} sats
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 text-muted-foreground font-mono whitespace-nowrap">
+                          {createdDate}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
 
         {/* PayGuard Reconciliation Section */}
         <Card className="p-6 bg-card border border-border flex flex-col gap-6">

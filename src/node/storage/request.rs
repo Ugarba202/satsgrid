@@ -783,4 +783,52 @@ impl RequestStore {
 
         Ok(total.unwrap_or(0).max(0) as u64)
     }
+
+    /// Count requests grouped by status.
+    pub async fn count_by_status(&self, status: &str) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_requests WHERE status = ?1",
+        )
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to count requests by status: {}", e)))?;
+
+        Ok(count.max(0) as u64)
+    }
+
+    /// Aggregate completed inference requests and revenue by model.
+    pub async fn model_activity_breakdown(&self) -> Result<Vec<(String, u64, u64)>> {
+        type Row = (String, i64, Option<i64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT model, COUNT(*) as cnt, SUM(charged_sats) as rev FROM inference_requests WHERE status = 'completed' GROUP BY model ORDER BY cnt DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to fetch model activity breakdown: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(model, cnt, rev)| (model, cnt.max(0) as u64, rev.unwrap_or(0).max(0) as u64))
+            .collect())
+    }
+
+    /// Fetch recent inference requests for operator dashboard audit logging.
+    pub async fn fetch_recent_requests(&self, limit: i64) -> Result<Vec<(String, String, String, u64, i64)>> {
+        type Row = (String, String, String, i64, i64);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, model, status, charged_sats, created_at FROM inference_requests ORDER BY created_at DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to fetch recent requests: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, model, status, sats, created_at)| {
+                (id, model, status, sats.max(0) as u64, created_at)
+            })
+            .collect())
+    }
 }

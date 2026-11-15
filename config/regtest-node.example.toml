@@ -2,6 +2,9 @@
 # SatsGrid Node Configuration - Regtest LND Mode (Example)
 # ==============================================================================
 
+# Root-level data directory
+data_dir = ".satsgrid-regtest"
+
 [server]
 host = "127.0.0.1"
 port = 8080
@@ -26,7 +29,7 @@ backend = "lnd"
 network = "regtest"
 
 # Provider LND (Bob) REST endpoint
-lnd_rest_host = "https://127.0.0.1:8082"
+lnd_rest_host = "https://127.0.0.1:8084"
 
 # Paths to Bob's invoice/admin macaroon and TLS certificate
 # Generated during Regtest / Polar initialization

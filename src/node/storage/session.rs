@@ -1267,4 +1267,15 @@ impl SessionStore {
 
         Ok(count.max(0) as u64)
     }
+
+    /// Sum total reserved sats currently held across sessions.
+    pub async fn total_reserved_sats(&self) -> Result<u64> {
+        let total: Option<i64> =
+            sqlx::query_scalar("SELECT SUM(reserved_sats) FROM sessions")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to sum reserved sats: {}", e)))?;
+
+        Ok(total.unwrap_or(0).max(0) as u64)
+    }
 }

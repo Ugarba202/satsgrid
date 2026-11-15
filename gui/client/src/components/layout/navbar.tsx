@@ -92,6 +92,12 @@ export function Navbar() {
                 Playground
               </Link>
               <Link
+                href="/explorer"
+                className={`transition-colors ${pathname === "/explorer" ? "text-foreground font-semibold" : "hover:text-foreground"}`}
+              >
+                Provider & Model Explorer
+              </Link>
+              <Link
                 href="/sessions"
                 className={`transition-colors ${pathname === "/sessions" ? "text-foreground font-semibold" : "hover:text-foreground"}`}
               >

@@ -1129,5 +1129,5 @@ async fn test_migration_12_model_registry_lifecycle_and_pricing() {
         .fetch_one(db.pool())
         .await
         .unwrap();
-    assert_eq!(applied_version, 12);
+    assert!(applied_version >= 12);
 }

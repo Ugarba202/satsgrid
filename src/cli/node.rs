@@ -4,7 +4,6 @@ use crate::discovery::{NodeAnnouncement, NostrDiscoveryClient};
 use crate::node::proxy::OpenAiProxy;
 use crate::node::server::SatsGridServer;
 use clap::{Args, Subcommand};
-use nostr_sdk::prelude::Keys;
 use reqwest::Client;
 use std::process;
 use std::time::Duration;
@@ -160,24 +159,15 @@ async fn announce_node(config: &NodeConfig, custom_relays: &[String], nsec_overr
         config.discovery.relays.clone()
     };
 
-    let keys = if let Some(key_str) = nsec_override {
-        match Keys::parse(key_str) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Invalid Nostr private key (nsec): {}", e);
-                return;
-            }
+    let keys = match SatsGridServer::load_or_generate_nostr_identity(
+        &config.data_dir,
+        nsec_override.or(config.discovery.nsec.as_deref()),
+    ) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("Failed to resolve Nostr identity: {}", e);
+            return;
         }
-    } else if let Some(key_str) = &config.discovery.nsec {
-        match Keys::parse(key_str) {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("Invalid Nostr private key in config: {}", e);
-                return;
-            }
-        }
-    } else {
-        Keys::generate()
     };
 
     let node_name = config
@@ -210,14 +200,23 @@ async fn announce_node(config: &NodeConfig, custom_relays: &[String], nsec_overr
         vec!["default".to_string()]
     };
 
+    // Load node receipt signer key_id if available to link receipt identity
+    let receipt_key_id =
+        crate::node::receipt::ReceiptSigner::load_or_generate(&config.data_dir, "satsgrid-node")
+            .ok()
+            .map(|s| s.key_id().to_string());
+
     let network = format!("{:?}", config.lightning.network).to_lowercase();
-    let announcement = NodeAnnouncement::new(
+    let mut announcement = NodeAnnouncement::new(
         node_name,
         node_url.clone(),
         models.clone(),
         config.pricing.default_price_sats.0,
         network,
     );
+    if let Some(ref kid) = receipt_key_id {
+        announcement = announcement.with_receipt_key_id(kid.clone());
+    }
 
     println!(
         "Broadcasting SatsGrid node announcement to Nostr relays: {:?}",

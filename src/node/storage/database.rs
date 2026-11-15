@@ -161,6 +161,11 @@ impl Database {
         crate::node::storage::model::ModelStore::new(self.pool.clone())
     }
 
+    /// Get a `ProviderStore` handle for discovered provider metadata and health status.
+    pub fn provider_store(&self) -> crate::node::storage::provider::ProviderStore {
+        crate::node::storage::provider::ProviderStore::new(self.pool.clone())
+    }
+
     /// Atomically finalize an inference request and its associated session reservation (if any)
     /// in a single SQLite transaction.
     ///
