@@ -8,6 +8,7 @@ use crate::node::lightning::mock::MockLightningBackend;
 use crate::node::lightning::nwc::NwcLightningBackend;
 use crate::node::lightning::LightningBackend;
 use crate::node::proxy::openai::OpenAiProxy;
+use crate::node::storage::Database;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
@@ -64,10 +65,45 @@ impl SatsGridServer {
         let addr = format!("{}:{}", self.config.server.host, self.config.server.port);
         tracing::info!("Starting SatsGrid Node on {}", addr);
 
+        // Initialize persistent SQLite database in data_dir
+        let db = Database::init(&self.config.data_dir).await?;
+
+        // Run startup crash recovery for in-flight requests and session reservations
+        let req_store = db.request_store();
+        match req_store.recover_in_flight_requests().await {
+            Ok(undispatched) => {
+                let undispatched_ids: Vec<String> =
+                    undispatched.into_iter().map(|(res_id, _)| res_id).collect();
+                if let Err(e) = db
+                    .session_store()
+                    .recover_in_flight_reservations(&undispatched_ids)
+                    .await
+                {
+                    tracing::warn!("Session recovery encountered error: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Request recovery encountered error: {}", e);
+            }
+        }
+
+        // Initialize persistent session budget manager
+        let budget_manager = Arc::new(SessionBudgetManager::with_store(db.session_store()));
+
         let macaroon_key = Self::load_or_generate_macaroon_key(&self.config.data_dir)?;
         let admin_token = Self::load_or_generate_admin_token(&self.config)?;
 
-        let proxy = OpenAiProxy::new(self.config.upstream.url.clone());
+        let proxy = OpenAiProxy::new_with_timeouts(
+            self.config.upstream.url.clone(),
+            std::time::Duration::from_secs(self.config.upstream.connect_timeout_secs),
+            std::time::Duration::from_secs(self.config.upstream.response_header_timeout_secs),
+        );
+
+        let concurrency_manager = Arc::new(crate::node::concurrency::ConcurrencyManager::new(
+            self.config.concurrency.max_concurrent_requests,
+            self.config.concurrency.max_concurrent_per_session,
+            self.config.concurrency.admission_timeout_secs,
+        ));
 
         let lightning_backend: Arc<dyn LightningBackend> = match self.config.lightning.backend {
             LightningBackendType::Mock => {
@@ -108,11 +144,13 @@ impl SatsGridServer {
             config: Arc::new(self.config.clone()),
             live_pricing: Arc::new(tokio::sync::RwLock::new(self.config.pricing.clone())),
             lightning: lightning_backend,
-            budget_manager: Arc::new(SessionBudgetManager::new()),
+            budget_manager,
             macaroon_service: Arc::new(MacaroonService::new(macaroon_key, "satsgrid-node")),
             proxy,
             stats: Arc::new(crate::node::api::NodeStats::default()),
             admin_token: Arc::new(admin_token),
+            db: Some(Arc::new(db)),
+            concurrency_manager,
         };
 
         let app = create_routes(state).layer(

@@ -17,7 +17,7 @@ export function Footer() {
         <div className="flex gap-4 text-sm font-medium text-muted-foreground">
           <Link href="/node" className="hover:text-foreground transition-colors">Run a Node</Link>
           <Link href="/playground" className="hover:text-foreground transition-colors">Playground</Link>
-          <Link href="https://github.com/infernos-ai/infernos" target="_blank" className="hover:text-foreground transition-colors">Source Code</Link>
+          <Link href="https://github.com/Ugarba202/satsgrid" target="_blank" className="hover:text-foreground transition-colors">Source Code</Link>
         </div>
       </div>
     </footer>

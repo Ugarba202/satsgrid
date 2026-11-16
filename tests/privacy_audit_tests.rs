@@ -41,10 +41,12 @@ fn setup_app() -> axum::Router {
             host: "127.0.0.1".to_string(),
             port: 8080,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(satsgrid::common::types::Satoshis(10)),
         upstream: satsgrid::config::schema::UpstreamConfig {
             url: "http://localhost:8080".to_string(),
+            ..Default::default()
         },
         lightning: satsgrid::config::schema::LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),
@@ -66,6 +68,12 @@ fn setup_app() -> axum::Router {
         proxy,
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config_arc.concurrency.max_concurrent_requests,
+            config_arc.concurrency.max_concurrent_per_session,
+            config_arc.concurrency.admission_timeout_secs,
+        )),
     };
 
     create_routes(state).layer(

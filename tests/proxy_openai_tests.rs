@@ -60,6 +60,104 @@ async fn test_proxy_forwards_required_upstream_headers() {
 }
 
 #[tokio::test]
+async fn test_proxy_sanitizes_upstream_headers_and_blocks_hop_by_hop() {
+    let mock_server = MockServer::start().await;
+    let proxy = OpenAiProxy::new(mock_server.uri());
+
+    let req_body = json!({"model": "llama3.2", "messages": [{"role": "user", "content": "hi"}]});
+
+    // Custom Matcher to strictly assert that forbidden transport headers are NEVER forwarded
+    struct SanitizeHeaderMatcher;
+    impl wiremock::Match for SanitizeHeaderMatcher {
+        fn matches(&self, request: &wiremock::Request) -> bool {
+            // Must have Content-Type application/json
+            let has_ct = request
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.contains("application/json"))
+                .unwrap_or(false);
+
+            // Must preserve User-Agent and Accept if in allowlist
+            let has_ua = request
+                .headers
+                .get("user-agent")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == "custom-agent/1.0")
+                .unwrap_or(false);
+
+            let has_accept = request
+                .headers
+                .get("accept")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s == "application/json")
+                .unwrap_or(false);
+
+            // MUST NOT contain forbidden headers
+            let no_auth = !request.headers.contains_key("authorization");
+            let no_conn = !request.headers.contains_key("connection");
+            let no_te = !request.headers.contains_key("transfer-encoding");
+            let no_keep_alive = !request.headers.contains_key("keep-alive");
+            let no_custom_poison = !request.headers.contains_key("x-custom-transport");
+
+            // Host header received by upstream should be the mock_server's host, NOT the client's spoofed host
+            let host_clean = request
+                .headers
+                .get("host")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s != "evil-spoofed-host.com")
+                .unwrap_or(true);
+
+            // Content-Length received by upstream must match Reqwest's serialized body, NOT the client's spoofed 999999
+            let cl_clean = request
+                .headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s != "999999")
+                .unwrap_or(true);
+
+            has_ct
+                && has_ua
+                && has_accept
+                && no_auth
+                && no_conn
+                && no_te
+                && no_keep_alive
+                && no_custom_poison
+                && host_clean
+                && cl_clean
+        }
+    }
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_json(&req_body))
+        .and(SanitizeHeaderMatcher)
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"choices": []})))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert("Authorization", "L402 secret-token".parse().unwrap());
+    headers.insert("Host", "evil-spoofed-host.com".parse().unwrap());
+    headers.insert("Content-Length", "999999".parse().unwrap());
+    headers.insert("Transfer-Encoding", "chunked".parse().unwrap());
+    headers.insert("Connection", "keep-alive, Upgrade".parse().unwrap());
+    headers.insert("Keep-Alive", "timeout=5".parse().unwrap());
+    headers.insert("X-Custom-Transport", "leaked-metadata".parse().unwrap());
+    headers.insert("User-Agent", "custom-agent/1.0".parse().unwrap());
+    headers.insert("Accept", "application/json".parse().unwrap());
+
+    let response = proxy
+        .forward_chat_completion_with_headers(req_body, headers)
+        .await
+        .expect("Sanitized request forwarding should succeed");
+
+    assert_eq!(response, json!({"choices": []}));
+}
+
+#[tokio::test]
 async fn test_proxy_returns_upstream_response() {
     let mock_server = MockServer::start().await;
     let proxy = OpenAiProxy::new(mock_server.uri());

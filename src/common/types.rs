@@ -11,7 +11,7 @@ pub struct Satoshis(pub u64);
 pub struct ModelId(pub String);
 
 /// Session identifier
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct SessionId(pub Uuid);
 
 /// 32-byte payment hash (hex-encoded string)

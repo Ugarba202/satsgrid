@@ -103,10 +103,12 @@ async fn test_end_to_end_client_node_integration() {
             host: "127.0.0.1".to_string(),
             port: 0,
             admin_token: None,
+            ..Default::default()
         },
         pricing: PricingConfig::new(Satoshis(10)),
         upstream: UpstreamConfig {
             url: upstream_mock.uri(),
+            ..Default::default()
         },
         lightning: LightningConfig::default(),
         data_dir: ".satsgrid_test_data".to_string(),
@@ -125,6 +127,12 @@ async fn test_end_to_end_client_node_integration() {
         proxy: OpenAiProxy::new(upstream_mock.uri()),
         stats: Arc::new(satsgrid::node::api::NodeStats::default()),
         admin_token: Arc::new("test-admin-token".to_string()),
+        db: None,
+        concurrency_manager: Arc::new(satsgrid::node::concurrency::ConcurrencyManager::new(
+            config.concurrency.max_concurrent_requests,
+            config.concurrency.max_concurrent_per_session,
+            config.concurrency.admission_timeout_secs,
+        )),
     };
 
     let app = create_routes(state);

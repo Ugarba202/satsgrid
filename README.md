@@ -1,6 +1,6 @@
 # SatsGrid
 
-**Africa-first AI compute access powered by Bitcoin Lightning.**
+**AI compute access powered by Bitcoin Lightning.**
 
 SatsGrid is an open, permissionless AI compute platform designed to bridge high-performance open-weight machine learning models with instant, sovereign micro-payments via Bitcoin Lightning and the L402 payment protocol.
 
@@ -35,7 +35,11 @@ SatsGrid operates as a modular, high-throughput gateway sitting directly between
 |                    SatsGrid Node Gateway                    |
 |  - L402 Macaroon Minting & Verification (HMAC-SHA256)       |
 |  - Dynamic Satoshi Pricing & Token Estimation               |
-|  - Atomic In-Memory & Session Spending Budget Enforcement   |
+|  - Persistent SQLite Session Budgets & Accounting           |
+|  - Single-Use Payment Authorization & Replay Prevention     |
+|  - Durable Inference Request Lifecycle State Machine        |
+|  - Monitored SSE Stream Delivery with Drop Guards           |
+|  - Crash Recovery (Conservative Reconciliation Flagging)    |
 |  - Privacy Shield (Zero prompt logging, Header Sanitizing)  |
 +-------------------------------------------------------------+
           |                                       |
@@ -48,29 +52,40 @@ SatsGrid operates as a modular, high-throughput gateway sitting directly between
 +----+         +-----+         +-----+     +--------------+
 ```
 
-### Key Capabilities Inherited from Infernos
+### Core Architecture Capabilities
 
 - **L402 Protocol Compliance:** Full support for `L402` and legacy `LSAT` HTTP `402 Payment Required` authentication flows.
 - **Pluggable Lightning Drivers:**
   - `Mock`: In-memory invoice and preimage simulator for local zero-wallet testing and automated CI.
   - `Lnd`: Direct REST integration with LND nodes for Testnet, Regtest, and Mainnet settlement.
   - `Nwc`: Nostr Wallet Connect (NIP-47) integration for automated client payments and node payouts over Nostr relays.
-- **Dual-Mode Billing:**
-  - *Pay-Per-Request*: Issue on-demand invoices for single completions.
-  - *Session Budgets*: Pre-fund multi-turn chat sessions with lock-free Compare-And-Swap (CAS) atomic budget debiting.
+- **Durable Persistence & Accounting (SQLite WAL Mode):**
+  - *Single-Use Payment Authorization*: Strict primary-key deduplication on `payment_hash` prevents replay attacks and double-spending across restarts.
+  - *Persistent Session Budgets*: Multi-step sessions with two-phase reservations, spend tracking, and append-only financial accounting ledgers (`sessions`, `session_reservations`, `accounting_entries`).
+  - *Durable Inference Lifecycle*: Central `inference_requests` state machine tracking requests from dispatch marker through upstream execution and completion.
+  - *Monitored Stream Delivery*: Safe Server-Sent Events (SSE) tracking with drop guards to distinguish natural completion from client disconnects without premature billing.
+  - *Conservative Crash Recovery*: Safe automatic rollback for unstarted reservations; ambiguous in-flight compute retained under `reconciliation_required = 1`.
 - **OpenAI-Compatible Reverse Proxy:** Transparent routing for `/v1/chat/completions` (JSON and Server-Sent Events streaming) and `/v1/models`.
 - **Zero-Logging Privacy Architecture:** Gateway logs exclude request bodies and authorization headers; user prompts and model completions are never written to disk or runtime spans.
 - **Nostr Relay Discovery (NIP-89):** Nodes can broadcast availability, supported models, and pricing via Nostr Kind 31990 events.
 
 ---
 
-## Current Limitations & Roadmap
+## Current Status & Roadmap
 
-While SatsGrid provides a robust protocol foundation, several advanced capabilities are planned for upcoming milestones:
+SatsGrid has completed its Phase 1 durable persistence, payment authorization, and inference lifecycle foundation:
 
-- **Settlement Timing & PayGuard:** The current engine settles payments prior to forwarding inference requests to the upstream model engine. If an upstream engine crashes or times out, payments are not automatically refunded. The upcoming **PayGuard** capability will introduce conditional hold-invoice settlement to guarantee inference integrity.
-- **In-Memory Session Volatility:** Active session balances currently reside in process memory. A node restart clears active session balances. Persistent storage (SQLite) is planned.
-- **Provider Marketplace Routing:** Discovered Nostr nodes currently function as an open bulletin board; dynamic automated multi-node routing and GPU attestation will be built in the next development phase.
+- **Completed Foundation (Phase 1):**
+  - Persistent SQLite storage with atomic WAL PRAGMAs.
+  - Single-use L402 payment authorization with atomic reservation.
+  - Durable session budget manager with append-only accounting ledgers.
+  - Durable inference request lifecycle coordinating payments, sessions, and proxy execution.
+  - Monitored SSE stream delivery with drop guards and atomic transition enforcement.
+  - Conservative startup crash recovery protecting against double-spends and unbilled compute.
+- **Planned Capabilities (Phase 2):**
+  - **PayGuard & Hold Invoices:** Introducing conditional hold-invoice settlement to hold satoshis until token generation completes, enabling native payment cancellation on upstream failures.
+  - **Dynamic Streaming Token Refund:** Reconciling token over-reservations dynamically upon SSE completion.
+  - **Provider Marketplace Routing:** Automated multi-node reputation and GPU attestation for the Nostr discovery network.
 
 ---
 

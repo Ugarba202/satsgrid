@@ -102,6 +102,7 @@ async fn test_lnd_backend_missing_config_errors() {
         lnd_macaroon_path: None,
         lnd_tls_cert_path: None,
         nwc_uri: None,
+        ..Default::default()
     };
 
     let result = LndBackend::from_config(&config);
@@ -226,6 +227,7 @@ async fn test_live_lnd_if_configured() {
             lnd_macaroon_path: Some(macaroon),
             lnd_tls_cert_path: cert_path,
             nwc_uri: None,
+            ..Default::default()
         };
 
         let backend =

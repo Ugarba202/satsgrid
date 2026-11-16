@@ -142,6 +142,7 @@ pub async fn handle_call_command(args: CallArgs) {
                 .clone()
                 .or_else(|| std::env::var("LND_PAYER_TLS_CERT_PATH").ok()),
             nwc_uri: None,
+            ..Default::default()
         };
         match crate::node::lightning::lnd::LndBackend::from_config(&cfg) {
             Ok(backend) => (Arc::new(backend), "LND (Automated)"),

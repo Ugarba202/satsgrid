@@ -21,6 +21,7 @@ flowchart TB
         Pricing["Pricing Engine"]
         BudgetMgr["Session Budget Manager"]
         MacaroonSvc["Macaroon Service"]
+        Storage["Persistent SQLite Store<br/>(WAL Mode)"]
         Proxy["OpenAI Proxy"]
     end
 
@@ -60,20 +61,28 @@ The Gate intercepts incoming HTTP requests to protected endpoints (`/v1/chat/com
   `WWW-Authenticate: L402 token="<macaroon>", invoice="<bolt11>"`
 - **`macaroon.rs`**: Issues and verifies HMAC-SHA256 cryptographically chained macaroons with optional caveats (`time`, `model`, `session`, `budget`).
 - **`verify.rs`**: Parses `Authorization: L402 <macaroon>:<preimage>` headers, verifies `SHA-256(preimage) == payment_hash`, checks backend settlement, and validates caveats.
-- **`budget.rs`**: Thread-safe, in-memory session balance manager (`SessionBudgetManager`) enforcing atomic CAS balance debits and exhaustion checks.
+- **`budget.rs`**: High-performance session balance manager (`SessionBudgetManager`) coordinating durable reservations, finalizations, and releases with SQLite persistence.
 
-### 2.2 Pricing Engine (`src/node/pricing.rs`)
+### 2.2 Persistent Storage Layer (`src/node/storage/`)
+Configures a durable SQLite storage engine operating in write-ahead log (WAL) mode:
+- **`payment.rs`**: `PaymentStore` provides atomic, single-use reservation semantics for pay-per-request payment hashes.
+- **`session.rs`**: `SessionStore` maintains durable session budgets, active two-phase reservations, and append-only financial event ledgers (`accounting_entries`).
+- **`request.rs`**: `RequestStore` implements the durable inference request lifecycle state machine (`reserved` -> `processing` -> `completed` / `failed` / `stream_interrupted`) and startup crash recovery.
+- **`migrations.rs`**: Versioned, transactional database migrations.
+
+### 2.3 Pricing Engine (`src/node/pricing.rs`)
 Calculates inference invoice costs dynamically:
 - Base flat rate per request (`default_price_sats` / `sats_per_request`).
 - Per-token pricing (`sats_per_prompt_token`, `sats_per_completion_token`).
 - Built-in heuristic token estimator for OpenAI chat completion payloads.
 
-### 2.3 OpenAI Proxy (`src/node/proxy/`)
+### 2.4 OpenAI Proxy (`src/node/proxy/`)
 - Interacts with upstream inference engines (e.g. `http://127.0.0.1:11434`).
 - Supports both standard JSON request/response forwarding and real-time Server-Sent Events (SSE) streaming (`stream: true`).
+- Monitored streaming wraps the response with drop guards to accurately track client disconnects and transport interruptions.
 - Performs dynamic upstream model discovery (`GET /v1/models`) with fallback to configured default models.
 
-### 2.4 Lightning Backend Abstraction (`src/node/lightning/`)
+### 2.5 Lightning Backend Abstraction (`src/node/lightning/`)
 - Defines an asynchronous `LightningBackend` trait:
   - `create_invoice(amount: Satoshis, description: &str) -> Result<Invoice>`
   - `is_invoice_settled(payment_hash: &PaymentHash) -> Result<bool>`

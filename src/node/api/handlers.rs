@@ -12,8 +12,27 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub async fn health_check() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "service": "satsgrid-node" }))
+pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let backend_str = match state.config.lightning.backend {
+        crate::config::schema::LightningBackendType::Mock => "mock",
+        crate::config::schema::LightningBackendType::Lnd => "lnd_rest",
+        crate::config::schema::LightningBackendType::Nwc => "nwc",
+    };
+    let network_str = match state.config.lightning.network {
+        crate::config::schema::BitcoinNetwork::Mainnet => "mainnet",
+        crate::config::schema::BitcoinNetwork::Testnet => "testnet",
+        crate::config::schema::BitcoinNetwork::Regtest => "regtest",
+        crate::config::schema::BitcoinNetwork::Signet => "signet",
+    };
+
+    Json(json!({
+        "status": "ok",
+        "service": "satsgrid-node",
+        "lightning": {
+            "backend": backend_str,
+            "network": network_str,
+        }
+    }))
 }
 
 pub async fn models(State(state): State<AppState>) -> impl IntoResponse {
@@ -42,7 +61,9 @@ pub struct NewSessionRequest {
 
 pub async fn new_session(
     State(state): State<AppState>,
-    Json(payload): Json<NewSessionRequest>,
+    crate::node::api::validation::BoundedJson(payload): crate::node::api::validation::BoundedJson<
+        NewSessionRequest,
+    >,
 ) -> Result<impl IntoResponse, Error> {
     if payload.budget_sats == 0 {
         return Err(Error::Internal(
@@ -63,8 +84,17 @@ pub async fn new_session(
     let uuid = uuid::Uuid::new_v4();
     let session_id = SessionId(uuid);
 
-    // Register session in the budget manager
-    state.budget_manager.open_session(&session_id, budget).await;
+    // Register pending session in the budget manager (persists as pending_payment in SQLite when db is active)
+    let default_expiry = chrono::Utc::now().timestamp() + 86400 * 30; // 30 days
+    state
+        .budget_manager
+        .create_pending_session(
+            &session_id,
+            Some(&invoice.payment_hash),
+            budget,
+            default_expiry,
+        )
+        .await?;
 
     // Mint macaroon with session caveats
     let caveats = vec![
@@ -102,24 +132,31 @@ pub async fn new_session(
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(payload): Json<Value>,
+    crate::node::api::validation::BoundedJson(payload): crate::node::api::validation::BoundedJson<
+        Value,
+    >,
 ) -> Result<impl IntoResponse, Error> {
+    // 1. Pre-auth Request Schema Validation
+    // Validate model, messages, roles, content, parameters before inspecting credentials or reserving funds.
+    let validation_rules = crate::node::api::validation::ChatValidationRules {
+        max_completion_tokens_limit: state.config.server.max_completion_tokens_limit,
+    };
+    let validated =
+        crate::node::api::validation::ValidatedChatRequest::validate(payload, &validation_rules)
+            .map_err(Error::Validation)?;
+
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
-    let prompt_tokens =
-        crate::node::pricing::PricingCalculator::estimate_prompt_tokens_from_payload(&payload);
-    let max_completion_tokens = payload
-        .get("max_tokens")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
+    let prompt_tokens = validated.prompt_tokens;
+    let max_completion_tokens = validated.max_tokens;
     let cost = state
         .pricing_calculator()
         .await
         .calculate_cost(prompt_tokens, max_completion_tokens);
-    let req_model = payload.get("model").and_then(|m| m.as_str());
+    let req_model = Some(validated.model.as_str());
 
     let auth_header = headers.get("Authorization");
     if auth_header.is_none()
@@ -202,27 +239,423 @@ pub async fn chat_completions(
     let (session_opt, _) =
         crate::node::gate::SessionBudgetManager::extract_session_caveats(&credentials.macaroon);
 
-    if let Some(session_id) = session_opt {
+    let payment_hash = credentials.macaroon.payment_hash();
+
+    let is_stream = validated.is_stream;
+
+    let req_mode = if is_stream {
+        crate::node::storage::RequestMode::Streaming
+    } else {
+        crate::node::storage::RequestMode::NonStreaming
+    };
+
+    let internal_request_id = uuid::Uuid::new_v4().to_string();
+    let idempotency_key = headers
+        .get("Idempotency-Key")
+        .or_else(|| headers.get("X-Request-ID"))
+        .and_then(|v| v.to_str().ok());
+
+    let mut session_reservation_id: Option<String> = None;
+
+    if let Some(session_id) = &session_opt {
+        // Step 2 & 2A: Lazy Session Activation with explicit payment-hash binding
+        // If this is a pending-payment session whose invoice was verified as settled,
+        // activate the session and record the initial funding ledger entry atomically,
+        // strictly verifying that session.payment_hash == credentials.macaroon.payment_hash().
+        state
+            .budget_manager
+            .activate_session_if_pending(session_id, &payment_hash)
+            .await?;
+
+        // Check session idempotency key if provided
+        if let (Some(db), Some(idem_key)) = (&state.db, idempotency_key) {
+            let req_store = db.request_store();
+            if let Some(existing) = req_store
+                .find_by_idempotency_key(session_id, idem_key)
+                .await?
+            {
+                if existing.status == crate::node::storage::RequestStatus::Completed {
+                    return Err(Error::VerificationFailed(
+                        "Idempotency key has already been consumed for this session".to_string(),
+                    ));
+                } else if existing.status == crate::node::storage::RequestStatus::Processing
+                    || existing.status == crate::node::storage::RequestStatus::Reserved
+                {
+                    return Err(Error::VerificationFailed(
+                        "A request with this idempotency key is currently in flight".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // Stage 7.3 & 7.4: Concurrency Admission Gate
+    // Placed strictly after authentication and pre-reservation idempotency inspection,
+    // but strictly BEFORE any session budget reservation or payment authorization consumption.
+    let concurrency_permit = state
+        .concurrency_manager
+        .acquire(session_opt.as_ref())
+        .await?;
+
+    if let Some(session_id) = &session_opt {
+        // Two-phase session reservation: reserve budget first
+        let res_id = uuid::Uuid::new_v4().to_string();
         let remaining = state
             .budget_manager
-            .debit_session(&session_id, cost)
+            .reserve_session(session_id, cost, &res_id)
             .await
             .map_err(|e| Error::BudgetExhausted(e.to_string()))?;
+
+        session_reservation_id = Some(res_id.clone());
 
         response_headers.insert(
             "X-SatsGrid-Remaining-Budget-Sats",
             remaining.0.to_string().parse().unwrap(),
         );
+
+        if let Some(db) = &state.db {
+            let req_store = db.request_store();
+            if let Err(e) = req_store
+                .create_request(
+                    &internal_request_id,
+                    None,
+                    Some(session_id),
+                    Some(&res_id),
+                    idempotency_key,
+                    &validated.model,
+                    req_mode,
+                    cost,
+                )
+                .await
+            {
+                if let Err(rel_err) = state
+                    .budget_manager
+                    .release_reservation(&res_id, "request_creation_failed")
+                    .await
+                {
+                    tracing::error!(
+                        reservation_id = %res_id,
+                        error = %rel_err,
+                        "Failed to release session reservation after request creation error"
+                    );
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        // Pay-per-request mode: enforce single-use authorization in persistent storage
+        if let Some(db) = &state.db {
+            let expires_at = credentials.macaroon.expires_at().unwrap_or(now + 3600);
+
+            let store = db.payment_store();
+            let reservation = store
+                .reserve_payment_hash(
+                    &payment_hash,
+                    &internal_request_id,
+                    expires_at,
+                    idempotency_key,
+                )
+                .await?;
+
+            match reservation {
+                crate::node::storage::ReservationResult::Reserved => {
+                    store.mark_settled_and_consumed(&payment_hash).await?;
+                }
+                crate::node::storage::ReservationResult::AlreadyUsed {
+                    state: auth_state, ..
+                } => {
+                    tracing::warn!(
+                        payment_hash = %payment_hash.0,
+                        state = %auth_state,
+                        "Replay detected for pay-per-request payment hash"
+                    );
+                    return Err(Error::Unauthorized(
+                        "Payment token has already been redeemed. Pay-per-request tokens are single-use.".to_string(),
+                    ));
+                }
+            }
+
+            let req_store = db.request_store();
+            req_store
+                .create_request(
+                    &internal_request_id,
+                    Some(&payment_hash),
+                    None,
+                    None,
+                    idempotency_key,
+                    &validated.model,
+                    req_mode,
+                    cost,
+                )
+                .await?;
+        }
     }
 
-    let is_stream = payload
-        .get("stream")
-        .and_then(|s| s.as_bool())
-        .unwrap_or(false);
+    // Durable Dispatch Boundary: Commit 'processing' state before upstream HTTP call
+    if let Some(db) = &state.db {
+        db.request_store()
+            .mark_processing(&internal_request_id)
+            .await?;
+    }
+
+    let upstream_dispatched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // RAII guard to safely handle client cancellations, timeouts, or unexpected task aborts
+    // occurring while request is in the 'processing' state.
+    struct DispatchCancellationGuard {
+        request_id: String,
+        session_reservation_id: Option<String>,
+        db: Option<std::sync::Arc<crate::node::storage::Database>>,
+        upstream_dispatched: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        defused: bool,
+    }
+
+    impl DispatchCancellationGuard {
+        fn defuse(&mut self) {
+            self.defused = true;
+        }
+    }
+
+    impl Drop for DispatchCancellationGuard {
+        fn drop(&mut self) {
+            if !self.defused {
+                if let Some(db) = self.db.take() {
+                    let r_id = self.request_id.clone();
+                    let s_res = self.session_reservation_id.clone();
+                    let dispatched = self
+                        .upstream_dispatched
+                        .load(std::sync::atomic::Ordering::SeqCst);
+
+                    tokio::spawn(async move {
+                        let req_store = db.request_store();
+                        if !dispatched {
+                            // If we definitely know the request was not sent or failed before transmission,
+                            // mark failed and release session reservation.
+                            let _ = req_store
+                                .mark_failed(&r_id, "connect_timeout_or_abort", "pre_dispatch")
+                                .await;
+                            if let Some(res_id) = s_res {
+                                let _ = db
+                                    .session_store()
+                                    .release_reservation(&res_id, "connect_timeout_or_abort")
+                                    .await;
+                            }
+                        } else {
+                            // Upstream transmission was in flight; execution may have occurred.
+                            // Conservative reconciliation required to protect session budget.
+                            let _ = req_store
+                                .mark_reconciliation_required(
+                                    &r_id,
+                                    "client_abort_or_timeout_after_dispatch",
+                                )
+                                .await;
+                            if let Some(res_id) = s_res {
+                                let _ = db
+                                    .session_store()
+                                    .mark_reconciliation_required(
+                                        &res_id,
+                                        "client_abort_or_timeout_after_dispatch",
+                                    )
+                                    .await;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    let mut dispatch_guard = DispatchCancellationGuard {
+        request_id: internal_request_id.clone(),
+        session_reservation_id: session_reservation_id.clone(),
+        db: state.db.clone(),
+        upstream_dispatched: upstream_dispatched.clone(),
+        defused: false,
+    };
+
+    let total_timeout =
+        std::time::Duration::from_secs(state.config.upstream.total_request_timeout_secs);
+    let idle_timeout =
+        std::time::Duration::from_secs(state.config.upstream.stream_idle_timeout_secs);
 
     if is_stream {
-        let stream = state.proxy.stream_chat_completion(payload).await?;
-        let body = axum::body::Body::from_stream(stream);
+        upstream_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+        let stream_result = state.proxy.stream_chat_completion(validated.raw).await;
+
+        let stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                // If it is an explicit connection failure, the request was definitely not executed
+                if matches!(e, Error::UpstreamConnect(_)) {
+                    dispatch_guard
+                        .upstream_dispatched
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                // Dropping dispatch_guard here will safely handle transitions based on upstream_dispatched flag
+                return Err(e);
+            }
+        };
+
+        // Finalize session reservation upon establishing stream
+        if let Some(res_id) = &session_reservation_id {
+            let _ = state.budget_manager.finalize_reservation(res_id).await;
+        }
+
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Poll};
+
+        let db_opt = state.db.clone();
+        let req_id_clone = internal_request_id.clone();
+        let prompt_tokens_i64 = prompt_tokens as i64;
+
+        struct MonitoredStream<S> {
+            inner: S,
+            req_id: String,
+            db: Option<std::sync::Arc<crate::node::storage::Database>>,
+            prompt_tokens: i64,
+            completed: std::sync::Arc<AtomicBool>,
+            deadline: std::time::Instant,
+            idle_sleep: Pin<Box<tokio::time::Sleep>>,
+            idle_timeout: std::time::Duration,
+            error_emitted: bool,
+            _permit: crate::node::concurrency::ConcurrencyPermit,
+        }
+
+        impl<S> Drop for MonitoredStream<S> {
+            fn drop(&mut self) {
+                // If stream is dropped before completion, mark stream_interrupted
+                if !self.completed.load(Ordering::SeqCst) {
+                    if let Some(db) = &self.db {
+                        let req_store = db.request_store();
+                        let r_id = self.req_id.clone();
+                        tokio::spawn(async move {
+                            let _ = req_store
+                                .mark_stream_interrupted(&r_id, "client_disconnected_early", None)
+                                .await;
+                        });
+                    }
+                }
+            }
+        }
+
+        impl<
+                S: futures_util::Stream<Item = crate::common::error::Result<bytes::Bytes>> + Unpin,
+            > futures_util::Stream for MonitoredStream<S>
+        {
+            type Item = crate::common::error::Result<bytes::Bytes>;
+
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Self::Item>> {
+                // 1. Check overall request deadline
+                if std::time::Instant::now() >= self.deadline {
+                    if !self.error_emitted {
+                        self.error_emitted = true;
+                        self.completed.store(true, Ordering::SeqCst);
+                        if let Some(db) = &self.db {
+                            let req_store = db.request_store();
+                            let r_id = self.req_id.clone();
+                            tokio::spawn(async move {
+                                let _ = req_store
+                                    .mark_stream_interrupted(&r_id, "stream_total_timeout", None)
+                                    .await;
+                            });
+                        }
+                        let sse_err = "event: error\ndata: {\"error\":{\"message\":\"Upstream total request deadline exceeded\",\"type\":\"upstream_timeout_error\",\"code\":\"stream_total_timeout\"}}\n\n";
+                        return Poll::Ready(Some(Ok(bytes::Bytes::from(sse_err))));
+                    }
+                    return Poll::Ready(None);
+                }
+
+                // 2. Poll inner stream for new data
+                match Pin::new(&mut self.inner).poll_next(cx) {
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        // Reset idle sleep timer only upon actual data receipt!
+                        let next_wake = tokio::time::Instant::now() + self.idle_timeout;
+                        self.idle_sleep.as_mut().reset(next_wake);
+                        Poll::Ready(Some(Ok(bytes)))
+                    }
+                    Poll::Ready(Some(Err(e))) => {
+                        self.completed.store(true, Ordering::SeqCst);
+                        if let Some(db) = &self.db {
+                            let req_store = db.request_store();
+                            let r_id = self.req_id.clone();
+                            tokio::spawn(async move {
+                                let _ = req_store
+                                    .mark_stream_interrupted(&r_id, "stream_read_error", None)
+                                    .await;
+                            });
+                        }
+                        Poll::Ready(Some(Err(e)))
+                    }
+                    Poll::Ready(None) => {
+                        // Stream finished normally!
+                        if !self.completed.swap(true, Ordering::SeqCst) {
+                            if let Some(db) = &self.db {
+                                let req_store = db.request_store();
+                                let r_id = self.req_id.clone();
+                                let p_tok = self.prompt_tokens;
+                                tokio::spawn(async move {
+                                    let _ =
+                                        req_store.mark_completed(&r_id, Some(p_tok), None).await;
+                                });
+                            }
+                        }
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => {
+                        // 3. Poll idle sleep timer
+                        match self.idle_sleep.as_mut().poll(cx) {
+                            Poll::Ready(()) => {
+                                // Idle timeout elapsed without data
+                                if !self.error_emitted {
+                                    self.error_emitted = true;
+                                    self.completed.store(true, Ordering::SeqCst);
+                                    if let Some(db) = &self.db {
+                                        let req_store = db.request_store();
+                                        let r_id = self.req_id.clone();
+                                        tokio::spawn(async move {
+                                            let _ = req_store
+                                                .mark_stream_interrupted(
+                                                    &r_id,
+                                                    "stream_idle_timeout",
+                                                    None,
+                                                )
+                                                .await;
+                                        });
+                                    }
+                                    let sse_err = "event: error\ndata: {\"error\":{\"message\":\"Upstream stream idle timeout exceeded\",\"type\":\"upstream_timeout_error\",\"code\":\"stream_idle_timeout\"}}\n\n";
+                                    return Poll::Ready(Some(Ok(bytes::Bytes::from(sse_err))));
+                                }
+                                Poll::Ready(None)
+                            }
+                            Poll::Pending => Poll::Pending,
+                        }
+                    }
+                }
+            }
+        }
+
+        let monitored_stream = MonitoredStream {
+            inner: stream,
+            req_id: req_id_clone,
+            db: db_opt,
+            prompt_tokens: prompt_tokens_i64,
+            completed: std::sync::Arc::new(AtomicBool::new(false)),
+            deadline: std::time::Instant::now() + total_timeout,
+            idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+            idle_timeout,
+            error_emitted: false,
+            _permit: concurrency_permit,
+        };
+
+        // MonitoredStream has assumed ownership; defuse dispatch guard
+        dispatch_guard.defuse();
+
+        let body = axum::body::Body::from_stream(monitored_stream);
         let mut resp = body.into_response();
         resp.headers_mut().extend(response_headers);
         resp.headers_mut()
@@ -239,25 +672,82 @@ pub async fn chat_completions(
 
         Ok(resp)
     } else {
-        // Proxy the request
-        let proxy_resp = state
-            .proxy
-            .forward_chat_completion_with_headers(payload, headers)
-            .await?;
+        // Retain concurrency permit in scope for non-streaming execution
+        let _permit = concurrency_permit;
 
-        let mut resp = Json(proxy_resp).into_response();
-        resp.headers_mut().extend(response_headers);
+        // Non-streaming execution with total request deadline
+        upstream_dispatched.store(true, std::sync::atomic::Ordering::SeqCst);
+        let proxy_res = tokio::time::timeout(
+            total_timeout,
+            state
+                .proxy
+                .forward_chat_completion_with_headers(validated.raw, headers),
+        )
+        .await;
 
-        state
-            .stats
-            .total_requests
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        state
-            .stats
-            .total_sats_earned
-            .fetch_add(cost.0, std::sync::atomic::Ordering::SeqCst);
+        let proxy_res = match proxy_res {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(Error::UpstreamTimeout(format!(
+                    "Total request deadline exceeded after {:?}",
+                    total_timeout
+                )));
+            }
+        };
 
-        Ok(resp)
+        match proxy_res {
+            Ok(proxy_resp) => {
+                // Upstream success: extract tokens if available
+                let (prompt_tok, comp_tok) = {
+                    let usage = proxy_resp.get("usage");
+                    let p = usage
+                        .and_then(|u| u.get("prompt_tokens"))
+                        .and_then(|v| v.as_i64());
+                    let c = usage
+                        .and_then(|u| u.get("completion_tokens"))
+                        .and_then(|v| v.as_i64());
+                    (p, c)
+                };
+
+                // Atomic non-streaming finalization
+                if let Some(db) = &state.db {
+                    db.finalize_request_and_session(
+                        &internal_request_id,
+                        session_reservation_id.as_deref(),
+                        prompt_tok,
+                        comp_tok,
+                    )
+                    .await?;
+                }
+
+                // Successful durable finalization; defuse guard
+                dispatch_guard.defuse();
+
+                let mut resp = Json(proxy_resp).into_response();
+                resp.headers_mut().extend(response_headers);
+
+                state
+                    .stats
+                    .total_requests
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .stats
+                    .total_sats_earned
+                    .fetch_add(cost.0, std::sync::atomic::Ordering::SeqCst);
+
+                Ok(resp)
+            }
+            Err(e) => {
+                // If it is an explicit connection failure, the request was definitely not executed
+                if matches!(e, Error::UpstreamConnect(_)) {
+                    dispatch_guard
+                        .upstream_dispatched
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                // Guard drop handles failure or reconciliation required
+                Err(e)
+            }
+        }
     }
 }
 
@@ -345,8 +835,46 @@ impl IntoResponse for Error {
             }
             Error::Forbidden(_) => (StatusCode::FORBIDDEN, self.to_string()),
             Error::BudgetExhausted(_) => (StatusCode::PAYMENT_REQUIRED, self.to_string()),
-            Error::Upstream(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            Error::Upstream(_) | Error::UpstreamConnect(_) => {
+                (StatusCode::BAD_GATEWAY, self.to_string())
+            }
+            Error::UpstreamTimeout(_) => {
+                let err_resp = crate::node::api::validation::OpenAiErrorResponse::new(
+                    self.to_string(),
+                    "upstream_timeout_error",
+                    None::<String>,
+                    Some("upstream_timeout"),
+                );
+                return err_resp.to_response(StatusCode::GATEWAY_TIMEOUT);
+            }
+            Error::ServerOverloaded(_) => {
+                let err_resp = crate::node::api::validation::OpenAiErrorResponse::new(
+                    self.to_string(),
+                    "server_overload_error",
+                    None::<String>,
+                    Some("node_capacity_exceeded"),
+                );
+                let mut resp = err_resp.to_response(StatusCode::SERVICE_UNAVAILABLE);
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+                return resp;
+            }
+            Error::ConcurrencyLimitExceeded(_) => {
+                let err_resp = crate::node::api::validation::OpenAiErrorResponse::new(
+                    self.to_string(),
+                    "concurrency_limit_error",
+                    None::<String>,
+                    Some("session_concurrency_exceeded"),
+                );
+                let mut resp = err_resp.to_response(StatusCode::TOO_MANY_REQUESTS);
+                resp.headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, "1".parse().unwrap());
+                return resp;
+            }
             Error::Lightning(_) => (StatusCode::BAD_GATEWAY, self.to_string()),
+            Error::Validation(val_err) => {
+                return val_err.to_response(StatusCode::BAD_REQUEST);
+            }
             Error::Config(_) | Error::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
             }

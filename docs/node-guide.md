@@ -135,7 +135,7 @@ The SatsGrid CLI provides full process lifecycle controls:
 cargo run -- node start --config config/node.toml
 
 # Or using the built release binary:
-./target/release/infernos node start --config config/node.toml
+./target/release/satsgrid node start --config config/node.toml
 ```
 
 Output:
@@ -184,7 +184,7 @@ docker compose -f docker/docker-compose.yml up -d
 
 To pull a model into the containerized Ollama instance:
 ```bash
-docker exec -it infernos-ollama ollama pull llama3.2
+docker exec -it satsgrid-ollama ollama pull llama3.2
 ```
 Your node is now accessible on port `8080`!
 
@@ -210,7 +210,7 @@ relays = [
 node_name = "My GPU Node"
 
 # Publicly reachable endpoint URL
-public_url = "https://infernos.my-domain.org"
+public_url = "https://node.satsgrid.org"
 
 # Optional: Nostr private key (nsec) to maintain a persistent identity across announcements
 # nsec = "nsec1..."
@@ -220,15 +220,15 @@ public_url = "https://infernos.my-domain.org"
 
 1. **Broadcast on Startup**:
    ```bash
-   infernos node start --config config/node.toml --announce
+   satsgrid node start --config config/node.toml --announce
    ```
 
 2. **Broadcast On Demand**:
    ```bash
    # Use configuration file
-   infernos node announce --config config/node.toml
+   satsgrid node announce --config config/node.toml
 
    # Override relays or private key
-   infernos node announce --config config/node.toml --relay wss://relay.damus.io
+   satsgrid node announce --config config/node.toml --relay wss://relay.damus.io
    ```
 
