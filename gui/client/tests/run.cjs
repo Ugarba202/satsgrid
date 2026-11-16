@@ -21,3 +21,4 @@ jiti("./tests/receipt_verifier.test.ts");
 jiti("./tests/receipt_public_verification.test.ts");
 jiti("./tests/pricing_estimator.test.ts");
 jiti("./tests/operator_accounting.test.ts");
+jiti("./tests/preimage_recovery.test.ts");

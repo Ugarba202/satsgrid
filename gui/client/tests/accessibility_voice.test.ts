@@ -82,3 +82,38 @@ test("Spoken Confirmations - authoritative event mapping rules", () => {
   const failMsg = formatAnnouncementMessage("inference_failed", "Insufficient balance");
   assert.equal(failMsg, "Inference failed. Insufficient balance");
 });
+
+test("Speech Recognition - progressive transcript updates avoid quadratic duplication", () => {
+  // Simulates progressive WebSpeech events: interim chunks build cumulatively,
+  // and when combined with base text, clean replacement preserves natural phrasing.
+  let input = "";
+  const inputBeforeSpeechRef = { current: "" };
+
+  const onStartListening = (currentInput: string) => {
+    inputBeforeSpeechRef.current = currentInput;
+  };
+
+  const handleTranscript = (newTranscript: string) => {
+    const base = inputBeforeSpeechRef.current.trim();
+    const speech = newTranscript.trim();
+    if (!speech) return;
+    input = base ? `${base} ${speech}` : speech;
+  };
+
+  // User already had some text typed
+  input = "Prompt:";
+  onStartListening(input);
+
+  // Progressive events received from speech engine
+  handleTranscript("explain");
+  assert.equal(input, "Prompt: explain");
+
+  handleTranscript("explain Bitcoin");
+  assert.equal(input, "Prompt: explain Bitcoin");
+
+  handleTranscript("explain Bitcoin Lightning payments");
+  assert.equal(input, "Prompt: explain Bitcoin Lightning payments");
+
+  handleTranscript("explain Bitcoin Lightning payments in simple terms");
+  assert.equal(input, "Prompt: explain Bitcoin Lightning payments in simple terms");
+});

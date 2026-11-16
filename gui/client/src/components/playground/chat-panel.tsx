@@ -10,7 +10,7 @@ import { parseBolt11Expiry, formatSecondsRemaining, type Bolt11ExpiryInfo } from
 import { LightningQrCode } from "@/components/satsgrid/lightning-qr-code";
 import { ReceiptDialog } from "./receipt-dialog";
 import { Message } from "@/types/inference";
-import { useState, useEffect, KeyboardEvent, useMemo } from "react";
+import { useState, useEffect, KeyboardEvent, useMemo, useRef } from "react";
 import { useSpeechRecognition } from "@/lib/speech/useSpeechRecognition";
 import { useSpeechSynthesis } from "@/lib/speech/useSpeechSynthesis";
 import { fetchNodeModels, type ModelEntry } from "@/lib/api/node";
@@ -75,6 +75,9 @@ export function ChatPanel({
     return availableModels.find((m) => m.id === selectedId) || null;
   }, [availableModels, sessionData.model]);
 
+  // Stores the existing textarea text before speech dictation begins
+  const inputBeforeSpeechRef = useRef<string>("");
+
   const costEstimate: CostEstimateResult = useMemo(() => {
     return estimateInferenceCost({
       text: input,
@@ -93,10 +96,10 @@ export function ChatPanel({
   } = useSpeechRecognition({
     onTranscript: (newTranscript) => {
       // Voice input safety: ONLY populates input field, NEVER auto-submits
-      setInput((prev) => {
-        const trimmed = prev.trim();
-        return trimmed ? `${trimmed} ${newTranscript}` : newTranscript;
-      });
+      const base = inputBeforeSpeechRef.current.trim();
+      const speech = newTranscript.trim();
+      if (!speech) return;
+      setInput(base ? `${base} ${speech}` : speech);
     },
   });
 
@@ -627,6 +630,40 @@ export function ChatPanel({
                     )}
                 </div>
 
+                {/* Manual Preimage Recovery Form for pending verification and invalid payment recovery */}
+                {(sessionStatus === "payment_submitted" || sessionStatus === "invalid_payment") && (
+                  <div className="flex flex-col gap-2 pt-2 border-t border-border/40">
+                    <span className="text-[11px] text-muted-foreground font-medium">
+                      {sessionStatus === "invalid_payment"
+                        ? "Enter or correct the 64-character payment preimage from your wallet to unlock:"
+                        : "Payment proof awaiting verification. You can re-enter or update your preimage below:"}
+                    </span>
+                    <div className="flex gap-2">
+                      <input
+                        type="password"
+                        placeholder="64-character hex preimage..."
+                        value={manualPreimage}
+                        onChange={(e) => setManualPreimage(e.target.value)}
+                        className="flex-1 bg-background border border-input rounded-md px-3 py-1.5 text-xs font-mono text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-1 focus:ring-lightning"
+                        disabled={expiryInfo?.isExpired}
+                        aria-label="Payment preimage input"
+                      />
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={handleVerifyManualPreimage}
+                        disabled={expiryInfo?.isExpired}
+                        className="text-xs font-semibold shrink-0"
+                      >
+                        Unlock
+                      </Button>
+                    </div>
+                    {preimageError && (
+                      <p className="text-[11px] text-destructive">{preimageError}</p>
+                    )}
+                  </div>
+                )}
+
                 {/* Balance Metadata summary when available */}
                 {(sessionStatus === "exhausted" ||
                   sessionStatus === "expired" ||
@@ -789,6 +826,7 @@ export function ChatPanel({
                   if (speechRecState === "listening") {
                     stopListening();
                   } else {
+                    inputBeforeSpeechRef.current = input;
                     startListening();
                   }
                 }}
