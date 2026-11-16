@@ -17,6 +17,8 @@ pub struct NodeAnnouncement {
     pub version: String,
     #[serde(default)]
     pub pubkey: Option<String>,
+    #[serde(default)]
+    pub receipt_key_id: Option<String>,
 }
 
 impl NodeAnnouncement {
@@ -36,7 +38,13 @@ impl NodeAnnouncement {
             network: network.into(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             pubkey: None,
+            receipt_key_id: None,
         }
+    }
+
+    pub fn with_receipt_key_id(mut self, key_id: impl Into<String>) -> Self {
+        self.receipt_key_id = Some(key_id.into());
+        self
     }
 
     /// Converts the announcement into a signed Nostr EventBuilder (NIP-89 / Kind 31990).
@@ -55,6 +63,13 @@ impl NodeAnnouncement {
             Tag::parse(["network", &self.network])
                 .map_err(|e| Error::Config(format!("Invalid network tag: {}", e)))?,
         ];
+
+        if let Some(ref key_id) = self.receipt_key_id {
+            tags.push(
+                Tag::parse(["receipt_key_id", key_id])
+                    .map_err(|e| Error::Config(format!("Invalid receipt_key_id tag: {}", e)))?,
+            );
+        }
 
         for model in &self.models {
             tags.push(
@@ -75,10 +90,28 @@ impl NodeAnnouncement {
             )));
         }
 
+        // Cryptographic verification: verify event ID and Schnorr signature
+        event.verify().map_err(|e| {
+            Error::VerificationFailed(format!("Invalid Nostr event signature: {}", e))
+        })?;
+
         let mut announcement: NodeAnnouncement = serde_json::from_str(&event.content)
             .map_err(|e| Error::Config(format!("Malformed announcement content: {}", e)))?;
 
         announcement.pubkey = Some(event.pubkey.to_hex());
+
+        if announcement.receipt_key_id.is_none() {
+            for tag in event.tags.iter() {
+                let slice = tag.as_slice();
+                if slice.first().map(|s| s.as_str()) == Some("receipt_key_id") {
+                    if let Some(val) = slice.get(1) {
+                        announcement.receipt_key_id = Some(val.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+
         Ok(announcement)
     }
 

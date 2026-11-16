@@ -1,6 +1,6 @@
 use crate::common::error::{Error, Result};
 use crate::common::types::{PaymentHash, Satoshis};
-use crate::node::lightning::backend::LightningBackend;
+use crate::node::lightning::backend::{LightningBackend, SettlementOutcome};
 use crate::node::lightning::invoice::Invoice;
 use async_trait::async_trait;
 use nostr::nips::nip47::{LookupInvoiceRequest, MakeInvoiceRequest, NostrWalletConnectUri};
@@ -68,17 +68,50 @@ impl LightningBackend for NwcLightningBackend {
     }
 
     async fn is_invoice_settled(&self, payment_hash: &PaymentHash) -> Result<bool> {
+        match self.check_settlement(payment_hash).await? {
+            SettlementOutcome::ConfirmedSettled { .. } => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    async fn check_settlement(&self, payment_hash: &PaymentHash) -> Result<SettlementOutcome> {
         let req = LookupInvoiceRequest {
             payment_hash: Some(payment_hash.0.clone()),
             invoice: None,
         };
-        let lookup_res = self
-            .client
-            .lookup_invoice(req)
-            .await
-            .map_err(|e| Error::Lightning(format!("NWC lookup_invoice error: {}", e)))?;
+        let lookup_res = match self.client.lookup_invoice(req).await {
+            Ok(res) => res,
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.to_lowercase().contains("not found") {
+                    return Ok(SettlementOutcome::Unknown { details: err_str });
+                }
+                return Ok(SettlementOutcome::BackendUnavailable { error: err_str });
+            }
+        };
 
-        Ok(lookup_res.settled_at.is_some())
+        if let Some(settled_at) = lookup_res.settled_at {
+            let amount_sats = Some(lookup_res.amount / 1000);
+            return Ok(SettlementOutcome::ConfirmedSettled {
+                preimage: lookup_res.preimage,
+                settled_at: settled_at.as_secs() as i64,
+                amount_sats,
+            });
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        if let Some(expires_at) = lookup_res.expires_at {
+            let exp_ts = expires_at.as_secs() as i64;
+            if now >= exp_ts {
+                return Ok(SettlementOutcome::ConfirmedExpired { expired_at: exp_ts });
+            } else {
+                return Ok(SettlementOutcome::ConfirmedPending {
+                    expires_at: Some(exp_ts),
+                });
+            }
+        }
+
+        Ok(SettlementOutcome::ConfirmedPending { expires_at: None })
     }
 }
 

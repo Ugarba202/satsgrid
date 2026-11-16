@@ -138,6 +138,32 @@ impl SessionBudgetManager {
         Ok(())
     }
 
+    /// Register a pending-payment session challenge with atomic funding invoice persistence.
+    pub async fn create_pending_session_with_invoice(
+        &self,
+        session_id: &SessionId,
+        payment_hash: &crate::common::types::PaymentHash,
+        bolt11: &str,
+        total_budget: Satoshis,
+        expires_at: i64,
+    ) -> Result<()> {
+        if let Some(store) = &self.store {
+            store
+                .create_pending_session_with_invoice(
+                    session_id,
+                    payment_hash,
+                    bolt11,
+                    total_budget,
+                    expires_at,
+                )
+                .await?;
+        } else {
+            let mut lock = self.pending_sessions.write().await;
+            lock.insert(session_id.0.to_string(), total_budget);
+        }
+        Ok(())
+    }
+
     /// Lazily activate a pending session upon verified payment settlement.
     ///
     /// Validates that the supplied `payment_hash` matches the session's recorded payment hash in SQLite.
@@ -330,6 +356,41 @@ impl SessionBudgetManager {
             store.finalize_reservation(reservation_id).await?;
         }
         Ok(())
+    }
+
+    /// Close an active or pending session.
+    pub async fn close_session(
+        &self,
+        session_id: &SessionId,
+        reason: Option<&str>,
+    ) -> Result<crate::node::storage::SessionCloseResult> {
+        if let Some(store) = &self.store {
+            let res = store.close_session(session_id, reason).await?;
+            if let crate::node::storage::SessionCloseResult::Closed { .. } = res {
+                let mut lock = self.sessions.write().await;
+                if let Some(b) = lock.get_mut(&session_id.0.to_string()) {
+                    b.remaining_sats.store(0, Ordering::SeqCst);
+                }
+            }
+            return Ok(res);
+        }
+
+        // Ephemeral in-memory fallback
+        let mut lock = self.sessions.write().await;
+        if let Some(b) = lock.get_mut(&session_id.0.to_string()) {
+            let spent = b.total_sats.0;
+            b.remaining_sats.store(0, Ordering::SeqCst);
+            let now = chrono::Utc::now().timestamp();
+            Ok(crate::node::storage::SessionCloseResult::Closed {
+                total_budget_sats: b.total_sats,
+                remaining_sats: Satoshis(0),
+                reserved_sats: Satoshis(0),
+                spent_sats: Satoshis(spent),
+                closed_at: now,
+            })
+        } else {
+            Ok(crate::node::storage::SessionCloseResult::NotFound)
+        }
     }
 
     /// Release an active reservation (e.g. pre-generation failure).

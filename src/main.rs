@@ -19,6 +19,12 @@ async fn main() -> Result<()> {
                 eprintln!("Discovery error: {}", e);
             }
         }
+        Commands::Receipt(args) => {
+            if let Err(e) = args.run().await {
+                eprintln!("Receipt error: {}", e);
+                std::process::exit(1);
+            }
+        }
     }
 
     Ok(())

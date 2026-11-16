@@ -8,25 +8,70 @@ import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/satsgrid/status-badge";
 import { SatsAmount } from "@/components/satsgrid/sats-amount";
 import { Progress } from "@/components/ui/progress";
-import { Activity, Key, Clock, Database, ArrowRight, Trash2, PlusCircle, MessageSquare } from "lucide-react";
+import { Activity, Key, Clock, Database, ArrowRight, Trash2, PlusCircle, MessageSquare, XCircle, AlertTriangle } from "lucide-react";
 import { 
   getStoredSessions, 
   deleteStoredSession, 
+  markStoredSessionClosed,
+  saveStoredSession,
   getActiveSessionId, 
   setActiveSessionId, 
   clearActiveSessionId, 
   StoredSession 
 } from "@/lib/storage/sessions";
+import { closeSession, getSession } from "@/lib/api/sessions";
 
 export default function SessionsPage() {
   const [sessions, setSessions] = useState<StoredSession[]>([]);
   const [activeSessionId, setActiveSessionIdState] = useState<string | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [closingSession, setClosingSession] = useState<StoredSession | null>(null);
+  const [isClosing, setIsClosing] = useState(false);
+  const [closeError, setCloseError] = useState<string | null>(null);
 
   useEffect(() => {
-    setSessions(getStoredSessions());
+    const initial = getStoredSessions();
+    setSessions(initial);
     setActiveSessionIdState(getActiveSessionId());
     setIsLoaded(true);
+
+    // Synchronize sessions that have credentials with authoritative backend metadata
+    const syncable = initial.filter((s) => s.macaroon && s.preimage);
+    if (syncable.length === 0) return;
+
+    let mounted = true;
+    void (async () => {
+      for (const s of syncable) {
+        try {
+          const snapshot = await getSession(s.id, {
+            macaroon: s.macaroon,
+            preimage: s.preimage!,
+          });
+          if (!mounted) break;
+          const updated: StoredSession = {
+            ...s,
+            status: snapshot.status,
+            budget_sats: snapshot.total_budget_sats,
+            remaining_sats: snapshot.remaining_sats,
+            reserved_sats: snapshot.reserved_sats,
+            spent_sats: snapshot.spent_sats,
+            requests_count: typeof snapshot.requests_count === "number" ? snapshot.requests_count : s.requests_count,
+            expires_at: snapshot.expires_at,
+            closed_at: snapshot.closed_at ?? undefined,
+          };
+          saveStoredSession(updated);
+          setSessions((current) =>
+            current.map((item) => (item.id === updated.id ? { ...item, ...updated } : item))
+          );
+        } catch {
+          // Keep cached session data intact when synchronization fails or network is unavailable
+        }
+      }
+    })();
+
+    return () => {
+      mounted = false;
+    };
   }, []);
 
   const handleDelete = (id: string) => {
@@ -39,6 +84,31 @@ export default function SessionsPage() {
   const handleSelectSession = (id: string) => {
     setActiveSessionId(id);
     setActiveSessionIdState(id);
+  };
+
+  const handleConfirmClose = async () => {
+    if (!closingSession) return;
+    setIsClosing(true);
+    setCloseError(null);
+
+    try {
+      await closeSession(
+        { session_id: closingSession.id, reason: "user_closed_from_gui" },
+        {
+          macaroon: closingSession.macaroon,
+          preimage: closingSession.preimage,
+        }
+      );
+
+      markStoredSessionClosed(closingSession.id, Date.now(), "user_closed_from_gui");
+      setSessions(getStoredSessions());
+      setClosingSession(null);
+    } catch (err: any) {
+      console.error("Failed to close session:", err);
+      setCloseError(err.message || "Failed to close session on backend");
+    } finally {
+      setIsClosing(false);
+    }
   };
 
   const totalCapability = sessions.reduce((acc, s) => acc + (s.budget_sats || 0), 0);
@@ -155,6 +225,7 @@ export default function SessionsPage() {
                             <StatusBadge variant="warning">Exhausted</StatusBadge>
                           )}
                           {session.status === "expired" && <StatusBadge variant="error">Expired</StatusBadge>}
+                          {session.status === "closed" && <StatusBadge variant="secondary">Closed</StatusBadge>}
                           {isCurrent && (
                             <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-primary/20 text-primary border border-primary/30">
                               ● Current
@@ -220,22 +291,55 @@ export default function SessionsPage() {
                       </div>
                     </div>
 
-                    {/* Actions: Resume & Delete */}
+                    {/* Actions: Resume, Close & Delete */}
                     <div className="flex items-center gap-3 lg:justify-end">
-                      <Link 
-                        href={`/playground?session=${session.id}`}
-                        onClick={() => handleSelectSession(session.id)}
-                      >
-                        <Button
-                          size="sm"
-                          variant={session.status === "active" ? "default" : "outline"}
-                          className="font-medium flex items-center gap-1.5 shadow-sm"
+                      {session.status === "active" ? (
+                        <>
+                          <Link 
+                            href={`/playground?session=${session.id}`}
+                            onClick={() => handleSelectSession(session.id)}
+                          >
+                            <Button
+                              size="sm"
+                              variant="default"
+                              className="font-medium flex items-center gap-1.5 shadow-sm"
+                            >
+                              <MessageSquare className="w-3.5 h-3.5" />
+                              Resume Chat
+                              <ArrowRight className="w-3.5 h-3.5 ml-0.5" />
+                            </Button>
+                          </Link>
+
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => {
+                              setClosingSession(session);
+                              setCloseError(null);
+                            }}
+                            className="font-medium flex items-center gap-1 text-destructive hover:text-destructive hover:bg-destructive/10 border-destructive/30"
+                            title="Close session permanently"
+                          >
+                            <XCircle className="w-3.5 h-3.5" />
+                            Close
+                          </Button>
+                        </>
+                      ) : (
+                        <Link 
+                          href={`/playground?session=${session.id}`}
+                          onClick={() => handleSelectSession(session.id)}
                         >
-                          <MessageSquare className="w-3.5 h-3.5" />
-                          {session.status === "active" ? "Resume Chat" : "View Chat"}
-                          <ArrowRight className="w-3.5 h-3.5 ml-0.5" />
-                        </Button>
-                      </Link>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="font-medium flex items-center gap-1.5 shadow-sm"
+                          >
+                            <MessageSquare className="w-3.5 h-3.5" />
+                            View Chat
+                            <ArrowRight className="w-3.5 h-3.5 ml-0.5" />
+                          </Button>
+                        </Link>
+                      )}
 
                       <button
                         onClick={() => handleDelete(session.id)}
@@ -249,6 +353,66 @@ export default function SessionsPage() {
                 </Card>
               );
             })}
+          </div>
+        )}
+
+        {/* Close Session Confirmation Modal */}
+        {closingSession && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4 animate-in fade-in-0">
+            <Card className="max-w-md w-full p-6 border-border shadow-xl bg-card flex flex-col gap-4">
+              <div className="flex items-center gap-3 text-warning">
+                <AlertTriangle className="w-6 h-6 shrink-0" />
+                <h3 className="text-lg font-bold text-foreground">Close Session Permanently?</h3>
+              </div>
+
+              <div className="flex flex-col gap-2 text-sm text-muted-foreground">
+                <p>
+                  You are about to close session <span className="font-mono text-foreground font-semibold">{closingSession.id.slice(0, 8)}...</span>.
+                </p>
+                <div className="p-3 bg-background rounded-md border border-border/50 text-xs flex flex-col gap-1.5 font-mono">
+                  <div className="flex justify-between">
+                    <span>Initial Budget:</span>
+                    <span className="text-foreground">{closingSession.budget_sats} sats</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Remaining Budget:</span>
+                    <span className="text-lightning font-semibold">{closingSession.remaining_sats} sats</span>
+                  </div>
+                </div>
+                <p className="text-xs text-warning/90 mt-1">
+                  Closing is final. Any remaining balance will be forfeited and no further inference requests will be admitted.
+                </p>
+
+                {closeError && (
+                  <div className="p-2.5 rounded bg-destructive/10 border border-destructive/20 text-destructive text-xs">
+                    {closeError}
+                  </div>
+                )}
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    setClosingSession(null);
+                    setCloseError(null);
+                  }}
+                  disabled={isClosing}
+                >
+                  Cancel
+                </Button>
+                <Button
+                  variant="default"
+                  size="sm"
+                  onClick={handleConfirmClose}
+                  disabled={isClosing}
+                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                >
+                  {isClosing ? "Closing..." : "Yes, Close Session"}
+                </Button>
+              </div>
+            </Card>
           </div>
         )}
       </main>

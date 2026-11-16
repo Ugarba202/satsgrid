@@ -1,20 +1,42 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Navbar } from "@/components/layout/navbar";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Activity, Cpu, Server, Network, Shield, Settings2, Users, Coins, Lock, KeyRound } from "lucide-react";
+import {
+  Activity,
+  Cpu,
+  Server,
+  Network,
+  Shield,
+  Settings2,
+  Users,
+  Coins,
+  Lock,
+  KeyRound,
+  AlertTriangle,
+  RefreshCw,
+  Clock,
+  HelpCircle,
+  FileText,
+  CheckCircle2,
+  XCircle,
+  Hourglass,
+  Layers,
+} from "lucide-react";
 import { StatusBadge } from "@/components/satsgrid/status-badge";
 import {
   fetchNodeHealth,
   fetchNodeModels,
   fetchNodeStats,
   fetchNodeConfig,
+  fetchReconciliationItems,
   NodeHealthResponse,
   ModelEntry,
   NodeStatsResponse,
   NodeConfigResponse,
+  ReconciliationItem,
 } from "@/lib/api/node";
 
 export default function NodeDashboardPage() {
@@ -26,27 +48,86 @@ export default function NodeDashboardPage() {
   const [adminInput, setAdminInput] = useState("");
   const [authError, setAuthError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshingAll, setIsRefreshingAll] = useState(false);
 
-  // Load public node health and models
-  useEffect(() => {
-    let isMounted = true;
-    async function fetchPublicData() {
-      try {
-        const [healthRes, modelsRes] = await Promise.all([
-          fetchNodeHealth().catch(() => null),
-          fetchNodeModels().catch(() => []),
-        ]);
-        if (isMounted) {
-          setHealth(healthRes);
-          setModels(modelsRes);
-        }
-      } catch (e) {
-        console.error("Failed to fetch public node data", e);
-      } finally {
-        if (isMounted) setIsLoading(false);
-      }
+  // PayGuard Reconciliation state
+  const [reconItems, setReconItems] = useState<ReconciliationItem[]>([]);
+  const [isReconLoading, setIsReconLoading] = useState(false);
+  const [reconError, setReconError] = useState<string | null>(null);
+
+  const fetchPublicData = useCallback(async () => {
+    try {
+      const [healthRes, modelsRes] = await Promise.all([
+        fetchNodeHealth().catch(() => null),
+        fetchNodeModels().catch(() => []),
+      ]);
+      setHealth(healthRes);
+      setModels(modelsRes);
+    } catch (e) {
+      console.error("Failed to fetch public node data", e);
+    } finally {
+      setIsLoading(false);
     }
+  }, []);
 
+  const loadReconciliation = useCallback(async (token: string) => {
+    if (!token) {
+      setReconItems([]);
+      return;
+    }
+    setIsReconLoading(true);
+    setReconError(null);
+    try {
+      const res = await fetchReconciliationItems(token);
+      setReconItems(res.items || []);
+    } catch (err: any) {
+      if (err.message && err.message.includes("401")) {
+        setAuthError("Unauthorized or invalid admin token.");
+        setReconItems([]);
+      } else {
+        setReconError(err.message || "Failed to load reconciliation records");
+      }
+    } finally {
+      setIsReconLoading(false);
+    }
+  }, []);
+
+  const fetchAdminData = useCallback(async (token: string) => {
+    if (!token) {
+      setStats(null);
+      setConfig(null);
+      return;
+    }
+    setAuthError(null);
+    try {
+      const [statsRes, configRes] = await Promise.all([
+        fetchNodeStats(token),
+        fetchNodeConfig(token),
+      ]);
+      setStats(statsRes);
+      setConfig(configRes);
+    } catch (e: any) {
+      setAuthError("Unauthorized or invalid admin token.");
+      setStats(null);
+      setConfig(null);
+    }
+  }, []);
+
+  const handleRefreshAll = async () => {
+    setIsRefreshingAll(true);
+    try {
+      await Promise.all([
+        fetchPublicData(),
+        adminToken ? fetchAdminData(adminToken) : Promise.resolve(),
+        adminToken ? loadReconciliation(adminToken) : Promise.resolve(),
+      ]);
+    } finally {
+      setIsRefreshingAll(false);
+    }
+  };
+
+  // Initial load
+  useEffect(() => {
     if (typeof window !== "undefined") {
       const savedToken = localStorage.getItem("satsgrid_admin_token");
       if (savedToken) {
@@ -54,47 +135,20 @@ export default function NodeDashboardPage() {
         setAdminInput(savedToken);
       }
     }
-
     fetchPublicData();
-    return () => {
-      isMounted = false;
-    };
-  }, []);
+  }, [fetchPublicData]);
 
   // Load authenticated operator stats and configuration
   useEffect(() => {
-    if (!adminToken) {
+    if (adminToken) {
+      fetchAdminData(adminToken);
+      loadReconciliation(adminToken);
+    } else {
       setStats(null);
       setConfig(null);
-      return;
+      setReconItems([]);
     }
-
-    let isMounted = true;
-    async function fetchAdminData() {
-      setAuthError(null);
-      try {
-        const [statsRes, configRes] = await Promise.all([
-          fetchNodeStats(adminToken),
-          fetchNodeConfig(adminToken),
-        ]);
-        if (isMounted) {
-          setStats(statsRes);
-          setConfig(configRes);
-        }
-      } catch (e: any) {
-        if (isMounted) {
-          setAuthError("Unauthorized or invalid admin token.");
-          setStats(null);
-          setConfig(null);
-        }
-      }
-    }
-
-    fetchAdminData();
-    return () => {
-      isMounted = false;
-    };
-  }, [adminToken]);
+  }, [adminToken, fetchAdminData, loadReconciliation]);
 
   const handleSaveToken = () => {
     const cleaned = adminInput.trim();
@@ -121,7 +175,7 @@ export default function NodeDashboardPage() {
             </p>
           </div>
 
-          {/* Admin Token Auth Bar */}
+          {/* Admin Token Auth Bar & Refresh Control */}
           <div className="flex flex-col gap-1.5 w-full md:w-auto">
             <div className="flex items-center gap-2">
               <input
@@ -135,12 +189,22 @@ export default function NodeDashboardPage() {
                 <KeyRound className="w-3.5 h-3.5 mr-1" />
                 {adminToken ? "Update" : "Authenticate"}
               </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleRefreshAll}
+                disabled={isRefreshingAll}
+                className="text-xs shrink-0"
+                title="Refresh All Dashboard Metrics"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingAll ? "animate-spin" : ""}`} />
+              </Button>
             </div>
             {authError && <p className="text-[11px] text-destructive font-mono">{authError}</p>}
           </div>
         </div>
 
-        {/* Top 4 Metrics Cards */}
+        {/* Top Operational & Accounting Metrics Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
           {/* Node Status */}
           <Card className="p-4 flex flex-col gap-2 bg-card">
@@ -206,17 +270,17 @@ export default function NodeDashboardPage() {
             )}
           </Card>
 
-          {/* Sats Earned / Lightning Backend */}
+          {/* Sats Earned / Settled Revenue */}
           <Card className="p-4 flex flex-col gap-2 bg-card">
             <div className="flex items-center gap-2 text-muted-foreground mb-2">
               <Coins className="w-4 h-4 text-lightning" />
-              <span className="text-xs uppercase tracking-wider font-semibold">Total Revenue</span>
+              <span className="text-xs uppercase tracking-wider font-semibold">Settled Revenue</span>
             </div>
             {stats ? (
               <div>
                 <span className="text-2xl font-bold text-lightning">{stats.total_sats_earned} SATS</span>
                 <div className="text-xs text-muted-foreground mt-1">
-                  Settled via {config?.lightning.backend.toUpperCase() || "Lightning"}
+                  Earned from completed inference ({config?.lightning?.backend?.toUpperCase() || health?.lightning?.backend?.toUpperCase() || "Lightning"})
                 </div>
               </div>
             ) : (
@@ -227,6 +291,104 @@ export default function NodeDashboardPage() {
             )}
           </Card>
         </div>
+
+        {/* Accounting & Request Lifecycle Breakdown (Admin Only) */}
+        {stats && (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Active Budget Reservations (Unearned) */}
+            <Card className="p-4 flex flex-col gap-2 bg-card border-amber-500/20">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Hourglass className="w-4 h-4 text-amber-500" />
+                  <span className="text-xs uppercase tracking-wider font-semibold text-foreground">
+                    Active Reservations
+                  </span>
+                </div>
+                <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-500 border border-amber-500/20">
+                  Unearned Hold
+                </span>
+              </div>
+              <div className="mt-1">
+                <span className="text-2xl font-bold font-mono text-amber-400">
+                  {stats.reserved_sats ?? 0} SATS
+                </span>
+                <p className="text-xs text-muted-foreground mt-1">
+                  Currently escrowed/held for in-flight streaming chunks. Not added to settled revenue until finalization.
+                </p>
+              </div>
+            </Card>
+
+            {/* Request Execution Outcomes */}
+            <Card className="p-4 flex flex-col gap-2 bg-card border-border">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Layers className="w-4 h-4 text-primary" />
+                  <span className="text-xs uppercase tracking-wider font-semibold text-foreground">
+                    Request Outcomes
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono text-muted-foreground">
+                  Durable Lifecycle
+                </span>
+              </div>
+              <div className="grid grid-cols-3 gap-2 mt-2">
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3 text-success" /> Completed
+                  </span>
+                  <span className="text-lg font-bold font-mono text-success mt-0.5">
+                    {stats.requests_breakdown?.completed ?? stats.total_requests}
+                  </span>
+                </div>
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                    <XCircle className="w-3 h-3 text-destructive" /> Failed
+                  </span>
+                  <span className="text-lg font-bold font-mono text-destructive mt-0.5">
+                    {stats.requests_breakdown?.failed ?? 0}
+                  </span>
+                </div>
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                    <AlertTriangle className="w-3 h-3 text-amber-400" /> In Recon
+                  </span>
+                  <span className="text-lg font-bold font-mono text-amber-400 mt-0.5">
+                    {stats.requests_breakdown?.reconciliation_required ?? 0}
+                  </span>
+                </div>
+              </div>
+            </Card>
+
+            {/* Lightning Invoices Overview */}
+            <Card className="p-4 flex flex-col gap-2 bg-card border-border">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Coins className="w-4 h-4 text-lightning" />
+                  <span className="text-xs uppercase tracking-wider font-semibold text-foreground">
+                    Lightning Invoices
+                  </span>
+                </div>
+                <span className="text-[10px] font-mono text-muted-foreground">
+                  L402 / Preimage
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground">Settled Invoices</span>
+                  <span className="text-lg font-bold font-mono text-lightning mt-0.5">
+                    {stats.invoices?.settled ?? 0}
+                  </span>
+                </div>
+                <div className="flex flex-col p-2 rounded-lg bg-background border border-border/60">
+                  <span className="text-[10px] text-muted-foreground">Pending Invoices</span>
+                  <span className="text-lg font-bold font-mono text-foreground mt-0.5">
+                    {stats.invoices?.pending ?? 0}
+                  </span>
+                </div>
+              </div>
+            </Card>
+          </div>
+        )}
 
         {/* Detailed Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
@@ -280,7 +442,7 @@ export default function NodeDashboardPage() {
                   <div className="flex flex-col gap-1 border-b border-border/40 pb-4">
                     <span className="text-xs text-muted-foreground uppercase tracking-wider">Host</span>
                     <span className="text-sm font-mono text-foreground">
-                      {config.server.host}:{config.server.port}
+                      {config.server?.host || "127.0.0.1"}:{config.server?.port || 8080}
                     </span>
                   </div>
                   <div className="flex flex-col gap-1 border-b border-border/40 pb-4">
@@ -288,7 +450,7 @@ export default function NodeDashboardPage() {
                       Lightning Backend
                     </span>
                     <span className="text-sm font-mono text-success uppercase">
-                      {config.lightning.backend}
+                      {config.lightning?.backend || health?.lightning?.backend || "Unknown"}
                     </span>
                   </div>
                   <div className="flex flex-col gap-1 border-b border-border/40 pb-4">
@@ -296,7 +458,7 @@ export default function NodeDashboardPage() {
                       Bitcoin Network
                     </span>
                     <span className="text-sm font-mono text-foreground uppercase">
-                      {config.lightning.network}
+                      {config.lightning?.network || health?.lightning?.network || "Unknown"}
                     </span>
                   </div>
                   <div className="flex flex-col gap-1 border-b border-border/40 pb-4">
@@ -304,7 +466,7 @@ export default function NodeDashboardPage() {
                       Flat Rate Pricing
                     </span>
                     <span className="text-sm font-mono text-lightning">
-                      {config.pricing?.flat_rate_sats ?? 0} sats / call
+                      {config.pricing?.flat_rate_sats ?? config.pricing?.default_price_sats ?? 0} sats / call
                     </span>
                   </div>
                 </div>
@@ -366,8 +528,262 @@ export default function NodeDashboardPage() {
                 </div>
               </div>
             </Card>
+
+            {/* Model Inference Activity & Revenue Breakdown */}
+            {stats && stats.model_breakdown && stats.model_breakdown.length > 0 && (
+              <Card className="p-6 bg-card border border-border flex flex-col gap-4">
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <Cpu className="w-5 h-5 text-primary" />
+                  Model Activity & Revenue
+                </h2>
+                <div className="flex flex-col gap-3">
+                  {stats.model_breakdown.map((item) => (
+                    <div
+                      key={item.model}
+                      className="flex items-center justify-between p-3 rounded-xl border border-border/60 bg-background"
+                    >
+                      <div className="flex flex-col gap-0.5">
+                        <span className="text-sm font-medium font-mono">{item.model}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {item.completed_requests} {item.completed_requests === 1 ? "completed call" : "completed calls"}
+                        </span>
+                      </div>
+                      <div className="flex flex-col items-end gap-0.5">
+                        <span className="text-sm font-bold font-mono text-lightning">
+                          {item.sats_earned} SATS
+                        </span>
+                        <span className="text-[10px] text-muted-foreground uppercase">
+                          Settled
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </Card>
+            )}
           </div>
         </div>
+
+        {/* Recent Inference Accounting Log (Admin Only) */}
+        {stats && stats.recent_requests && stats.recent_requests.length > 0 && (
+          <Card className="p-6 bg-card border border-border flex flex-col gap-6">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-border/40 pb-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0">
+                  <FileText className="w-5 h-5 text-primary" />
+                </div>
+                <div>
+                  <h2 className="text-lg font-semibold text-foreground">Recent Inference Accounting Log</h2>
+                  <p className="text-xs text-muted-foreground mt-0.5">
+                    Persisted execution records and actual charged amounts from the SQLite inference ledger.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto -mx-6 px-6">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-border/60 text-muted-foreground font-mono">
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Status</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Request ID</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Model</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Charged Sats</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Timestamp</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/30">
+                  {stats.recent_requests.map((req) => {
+                    const statusVariant =
+                      req.status === "completed"
+                        ? "success"
+                        : req.status === "reconciliation_required"
+                        ? "warning"
+                        : "destructive";
+                    const createdDate = new Date(req.created_at * 1000).toLocaleString();
+
+                    return (
+                      <tr key={req.id} className="hover:bg-muted/30 transition-colors">
+                        <td className="py-3 px-3">
+                          <StatusBadge variant={statusVariant as any}>
+                            {req.status.replace(/_/g, " ").toUpperCase()}
+                          </StatusBadge>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-foreground">
+                          <span title={req.id} className="cursor-help">
+                            {req.id.length > 16
+                              ? `${req.id.slice(0, 8)}...${req.id.slice(-6)}`
+                              : req.id}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-foreground font-medium">
+                          {req.model}
+                        </td>
+                        <td className="py-3 px-3 font-mono">
+                          <span className={req.status === "completed" ? "text-lightning font-semibold" : "text-muted-foreground"}>
+                            {req.charged_sats} sats
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 text-muted-foreground font-mono whitespace-nowrap">
+                          {createdDate}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        )}
+
+        {/* PayGuard Reconciliation Section */}
+        <Card className="p-6 bg-card border border-border flex flex-col gap-6">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-border/40 pb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5 text-amber-500" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <h2 className="text-lg font-semibold text-foreground">PayGuard Reconciliation</h2>
+                  {stats?.reconciliation?.unresolved_items != null && (
+                    <span className="px-2 py-0.5 text-xs font-mono font-medium rounded-full bg-amber-500/20 text-amber-400 border border-amber-500/30">
+                      {stats.reconciliation.unresolved_items} unresolved
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground mt-0.5">
+                  Durable request accounting, quarantined session reservations, and ambiguous upstream dispatch tracking.
+                </p>
+              </div>
+            </div>
+
+            {adminToken && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => loadReconciliation(adminToken)}
+                disabled={isReconLoading}
+                className="text-xs shrink-0 self-start sm:self-auto"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 mr-1.5 ${isReconLoading ? "animate-spin" : ""}`} />
+                Refresh Records
+              </Button>
+            )}
+          </div>
+
+          {!adminToken ? (
+            <div className="p-8 text-center text-muted-foreground border border-dashed border-border rounded-xl flex flex-col items-center gap-2">
+              <Lock className="w-6 h-6 text-muted-foreground/60" />
+              <p className="text-sm">
+                Authenticate with your operator admin token above to view PayGuard reconciliation records.
+              </p>
+            </div>
+          ) : isReconLoading && reconItems.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-12 gap-3 text-muted-foreground">
+              <RefreshCw className="w-6 h-6 animate-spin text-primary" />
+              <span className="text-sm font-mono">Loading reconciliation items...</span>
+            </div>
+          ) : reconError ? (
+            <div className="p-4 rounded-xl border border-destructive/30 bg-destructive/10 text-destructive text-sm flex items-center justify-between">
+              <span className="font-mono text-xs">{reconError}</span>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => loadReconciliation(adminToken)}
+                className="text-xs"
+              >
+                Retry
+              </Button>
+            </div>
+          ) : reconItems.length === 0 ? (
+            <div className="p-8 text-center text-muted-foreground border border-dashed border-border rounded-xl flex flex-col items-center gap-2">
+              <Shield className="w-6 h-6 text-success/60" />
+              <span className="text-sm font-medium text-foreground">All Clear</span>
+              <p className="text-xs max-w-sm">
+                No unresolved reconciliation records detected. All sessions and inference requests are consistently finalized.
+              </p>
+            </div>
+          ) : (
+            <div className="overflow-x-auto -mx-6 px-6">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="border-b border-border/60 text-muted-foreground font-mono">
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Status</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Type</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Reference / Request ID</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Session ID</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Reserved Sats</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Reason</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Details</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Detected At</th>
+                    <th className="py-2.5 px-3 uppercase tracking-wider font-semibold">Retries</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border/30">
+                  {reconItems.map((item) => {
+                    const statusVariant =
+                      item.status === "unresolved"
+                        ? "destructive"
+                        : item.status === "in_progress"
+                        ? "warning"
+                        : "secondary";
+
+                    const detectedDate = new Date(item.first_detected_at * 1000).toLocaleString();
+
+                    return (
+                      <tr key={item.id} className="hover:bg-muted/30 transition-colors">
+                        <td className="py-3 px-3">
+                          <StatusBadge variant={statusVariant as any}>
+                            {item.status.toUpperCase()}
+                          </StatusBadge>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-foreground font-medium">
+                          {item.item_type}
+                        </td>
+                        <td className="py-3 px-3 font-mono text-foreground">
+                          <span title={item.reference_id} className="cursor-help">
+                            {item.reference_id.length > 16
+                              ? `${item.reference_id.slice(0, 8)}...${item.reference_id.slice(-6)}`
+                              : item.reference_id}
+                          </span>
+                        </td>
+                        <td className="py-3 px-3 font-mono text-muted-foreground">
+                          {item.session_id ? (
+                            <span title={item.session_id} className="cursor-help text-primary/90">
+                              {item.session_id.slice(0, 8)}...{item.session_id.slice(-4)}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground/50">—</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 font-mono">
+                          {item.reserved_sats != null ? (
+                            <span className="text-lightning font-semibold">{item.reserved_sats} sats</span>
+                          ) : (
+                            <span className="text-muted-foreground/50">—</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 font-mono text-amber-400 font-medium max-w-xs truncate" title={item.reason}>
+                          {item.reason}
+                        </td>
+                        <td className="py-3 px-3 text-muted-foreground max-w-sm truncate" title={item.error_details || undefined}>
+                          {item.error_details || "—"}
+                        </td>
+                        <td className="py-3 px-3 text-muted-foreground font-mono whitespace-nowrap">
+                          {detectedDate}
+                        </td>
+                        <td className="py-3 px-3 text-muted-foreground font-mono text-center">
+                          {item.attempt_count}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </Card>
       </main>
     </div>
   );

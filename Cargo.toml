@@ -2,11 +2,11 @@
 name = "satsgrid"
 version = "0.1.0"
 edition = "2021"
-authors = ["Muhammad Hamza <hamza.00dev1@gmail.com>"]
+authors = ["Usman Umar Garba <ugarba202@gmail.com>"]
 description = "Permissionless Open-Model Inference Paid in Sats via L402"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/infernos-ai/infernos"
+repository = "https://github.com/Ugarba202/satsgrid/"
 keywords = ["lightning", "l402", "inference", "ai", "bitcoin"]
 categories = ["cryptography::cryptocurrencies", "web-programming::http-server"]
 
@@ -29,7 +29,11 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "default-tls",
+] }
 http = "1.2"
 
 # Serialization & Config
@@ -43,6 +47,7 @@ hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
 rand = "0.8"
+ring = "0.17"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
@@ -62,7 +67,13 @@ bytes = "1.12.1"
 nostr-sdk = "0.45.4"
 nostr = { version = "0.45.5", features = ["nip47"] }
 nwc = "0.45.1"
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.9.0", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "chrono",
+    "uuid",
+] }
 
 [dev-dependencies]
 tokio-test = "0.4"

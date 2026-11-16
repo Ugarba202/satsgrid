@@ -233,6 +233,128 @@ pub const MIGRATIONS: &[Migration] = &[
         "#,
         requires_foreign_keys_disabled: false,
     },
+    Migration {
+        version: 8,
+        name: "session_closure_tracking_and_settlement",
+        sql: r#"
+        -- 1. Add closure metadata columns to sessions table
+        ALTER TABLE sessions ADD COLUMN closed_at INTEGER;
+        ALTER TABLE sessions ADD COLUMN closed_reason TEXT;
+
+        CREATE INDEX IF NOT EXISTS idx_sessions_closed_at ON sessions(closed_at) WHERE closed_at IS NOT NULL;
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 9,
+        name: "payguard_reconciliation_items",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS reconciliation_items (
+            id TEXT PRIMARY KEY,
+            item_type TEXT NOT NULL CHECK (item_type IN ('invoice', 'inference_request', 'session_late_funding')),
+            reference_id TEXT NOT NULL,
+            payment_hash TEXT,
+            session_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+            status TEXT NOT NULL CHECK (status IN ('unresolved', 'in_progress', 'resolved', 'ignored')),
+            reason TEXT NOT NULL,
+            error_details TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            first_detected_at INTEGER NOT NULL,
+            last_attempt_at INTEGER,
+            next_retry_at INTEGER,
+            resolved_at INTEGER
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_reconciliation_status ON reconciliation_items(status);
+        CREATE INDEX IF NOT EXISTS idx_reconciliation_next_retry ON reconciliation_items(next_retry_at) WHERE status = 'unresolved';
+        CREATE INDEX IF NOT EXISTS idx_reconciliation_reference ON reconciliation_items(reference_id);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 10,
+        name: "payguard_signed_receipts",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS receipts (
+            id TEXT PRIMARY KEY,
+            request_id TEXT NOT NULL REFERENCES inference_requests(id) ON DELETE RESTRICT,
+            receipt_version INTEGER NOT NULL DEFAULT 1,
+            signing_key_id TEXT NOT NULL,
+            signature_algorithm TEXT NOT NULL,
+            public_key_hex TEXT NOT NULL,
+            canonical_payload TEXT NOT NULL,
+            signature_hex TEXT NOT NULL,
+            inference_status TEXT NOT NULL,
+            payment_status TEXT NOT NULL,
+            charged_sats INTEGER NOT NULL,
+            supersedes_receipt_id TEXT REFERENCES receipts(id) ON DELETE SET NULL,
+            created_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_receipts_request_id ON receipts(request_id);
+        CREATE INDEX IF NOT EXISTS idx_receipts_created_at ON receipts(created_at);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 11,
+        name: "one_signed_receipt_per_request",
+        sql: r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_unique_request_id ON receipts(request_id);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 12,
+        name: "create_model_registry",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS models (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            owned_by TEXT NOT NULL DEFAULT 'satsgrid-node',
+            description TEXT,
+            context_length INTEGER,
+            flat_rate_sats INTEGER CHECK (flat_rate_sats IS NULL OR flat_rate_sats >= 0),
+            sats_per_prompt_token INTEGER CHECK (sats_per_prompt_token IS NULL OR sats_per_prompt_token >= 0),
+            sats_per_completion_token INTEGER CHECK (sats_per_completion_token IS NULL OR sats_per_completion_token >= 0),
+            is_enabled BOOLEAN NOT NULL DEFAULT 1,
+            is_available BOOLEAN NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_models_is_enabled ON models(is_enabled);
+        CREATE INDEX IF NOT EXISTS idx_models_is_available ON models(is_available);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
+    Migration {
+        version: 13,
+        name: "create_provider_registry",
+        sql: r#"
+        CREATE TABLE IF NOT EXISTS providers (
+            pubkey TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            models TEXT NOT NULL,
+            pricing_sats INTEGER NOT NULL,
+            network TEXT NOT NULL,
+            version TEXT NOT NULL,
+            receipt_key_id TEXT,
+            status TEXT NOT NULL DEFAULT 'discovered' CHECK (status IN ('discovered', 'reachable', 'healthy', 'offline', 'error')),
+            last_seen_at INTEGER NOT NULL,
+            last_checked_at INTEGER,
+            last_error TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_providers_status ON providers(status);
+        CREATE INDEX IF NOT EXISTS idx_providers_network ON providers(network);
+        CREATE INDEX IF NOT EXISTS idx_providers_last_seen ON providers(last_seen_at);
+        "#,
+        requires_foreign_keys_disabled: false,
+    },
 ];
 
 /// Execute pending migrations against the SQLite pool in an atomic transaction.

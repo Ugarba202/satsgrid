@@ -1,5 +1,7 @@
 pub mod handlers;
 pub mod routes;
+pub mod session_closure;
+pub mod session_read;
 pub mod validation;
 
 use crate::config::schema::{NodeConfig, PricingConfig};
@@ -33,7 +35,30 @@ pub struct AppState {
     pub concurrency_manager: Arc<ConcurrencyManager>,
 }
 
+// In-process global reference for optional reconciliation worker to avoid breaking AppState struct construction across 20+ test files
+static RECON_WORKER: tokio::sync::OnceCell<Arc<crate::node::worker::ReconciliationWorker>> =
+    tokio::sync::OnceCell::const_new();
+
+// In-process global reference for receipt signer
+static RECEIPT_SIGNER: tokio::sync::OnceCell<Arc<crate::node::receipt::ReceiptSigner>> =
+    tokio::sync::OnceCell::const_new();
+
 impl AppState {
+    pub fn set_reconciliation_worker(worker: Arc<crate::node::worker::ReconciliationWorker>) {
+        let _ = RECON_WORKER.set(worker);
+    }
+
+    pub fn reconciliation_worker() -> Option<Arc<crate::node::worker::ReconciliationWorker>> {
+        RECON_WORKER.get().cloned()
+    }
+
+    pub fn set_receipt_signer(signer: Arc<crate::node::receipt::ReceiptSigner>) {
+        let _ = RECEIPT_SIGNER.set(signer);
+    }
+
+    pub fn receipt_signer() -> Option<Arc<crate::node::receipt::ReceiptSigner>> {
+        RECEIPT_SIGNER.get().cloned()
+    }
     pub async fn pricing_calculator(&self) -> PricingCalculator {
         let pricing = self.live_pricing.read().await.clone();
         PricingCalculator::new(pricing)

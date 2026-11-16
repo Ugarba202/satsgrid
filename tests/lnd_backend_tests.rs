@@ -212,6 +212,58 @@ async fn test_lnd_backend_mainnet_flow() {
 }
 
 #[tokio::test]
+async fn test_lnd_backend_tls_cert_parsing_errors() {
+    use std::io::Write;
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // 1. Create a valid dummy macaroon file
+    let macaroon_path = temp_dir.path().join("admin.macaroon");
+    let mut mac_file = std::fs::File::create(&macaroon_path).unwrap();
+    mac_file.write_all(b"dummy_macaroon_bytes").unwrap();
+
+    // 2. Test missing cert file
+    let missing_cert_path = temp_dir.path().join("missing.cert");
+    let config_missing_cert = LightningConfig {
+        backend: LightningBackendType::Lnd,
+        network: BitcoinNetwork::Testnet,
+        lnd_rpc_host: Some("https://127.0.0.1:8080".to_string()),
+        lnd_macaroon_path: Some(macaroon_path.to_str().unwrap().to_string()),
+        lnd_tls_cert_path: Some(missing_cert_path.to_str().unwrap().to_string()),
+        nwc_uri: None,
+        ..Default::default()
+    };
+    let err_missing = match LndBackend::from_config(&config_missing_cert) {
+        Err(e) => e,
+        Ok(_) => panic!("Expected error for missing cert"),
+    };
+    assert!(err_missing
+        .to_string()
+        .contains("Failed to read LND tls.cert"));
+
+    // 3. Test invalid PEM cert file
+    let invalid_cert_path = temp_dir.path().join("invalid.cert");
+    let mut cert_file = std::fs::File::create(&invalid_cert_path).unwrap();
+    cert_file.write_all(b"NOT A VALID PEM CERTIFICATE").unwrap();
+
+    let config_invalid_cert = LightningConfig {
+        backend: LightningBackendType::Lnd,
+        network: BitcoinNetwork::Testnet,
+        lnd_rpc_host: Some("https://127.0.0.1:8080".to_string()),
+        lnd_macaroon_path: Some(macaroon_path.to_str().unwrap().to_string()),
+        lnd_tls_cert_path: Some(invalid_cert_path.to_str().unwrap().to_string()),
+        nwc_uri: None,
+        ..Default::default()
+    };
+    let err_invalid = match LndBackend::from_config(&config_invalid_cert) {
+        Err(e) => e,
+        Ok(_) => panic!("Expected error for invalid PEM cert"),
+    };
+    assert!(err_invalid
+        .to_string()
+        .contains("Failed to parse LND tls.cert as PEM"));
+}
+
+#[tokio::test]
 async fn test_live_lnd_if_configured() {
     let rest_host = std::env::var("LND_TEST_REST_HOST").ok();
     let macaroon_path = std::env::var("LND_TEST_MACAROON_PATH").ok();

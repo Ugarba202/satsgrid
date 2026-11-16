@@ -493,6 +493,178 @@ impl RequestStore {
         Ok(())
     }
 
+    /// Atomically protect an ambiguous request, its reservation, and its reconciliation item.
+    /// Repeated calls update the same unresolved item and do not alter session balances.
+    pub async fn mark_ambiguous_reconciliation_required(
+        &self,
+        request_id: &str,
+        reason: &str,
+        error_details: &str,
+    ) -> Result<String> {
+        self.mark_ambiguous_reconciliation_required_inner(request_id, reason, error_details, true)
+            .await
+    }
+
+    /// Persist a completed stream's failed accounting/receipt finalization for manual recovery.
+    /// The reconciliation item intentionally omits its payment hash so the invoice worker cannot
+    /// resolve this request merely by observing the already-known Lightning settlement.
+    pub async fn mark_stream_finalization_recovery_required(
+        &self,
+        request_id: &str,
+        reason: &str,
+        error_details: &str,
+    ) -> Result<String> {
+        self.mark_ambiguous_reconciliation_required_inner(request_id, reason, error_details, false)
+            .await
+    }
+
+    async fn mark_ambiguous_reconciliation_required_inner(
+        &self,
+        request_id: &str,
+        reason: &str,
+        error_details: &str,
+        attach_payment_hash: bool,
+    ) -> Result<String> {
+        let now = chrono::Utc::now().timestamp();
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            Error::Internal(format!(
+                "Failed to acquire request reconciliation connection: {}",
+                e
+            ))
+        })?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                Error::Internal(format!(
+                    "Failed to begin ambiguous request transaction: {}",
+                    e
+                ))
+            })?;
+
+        let transition_result = async {
+            let request: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT payment_hash, session_id FROM inference_requests WHERE id = ?1 AND status IN ('reserved', 'processing', 'stream_interrupted', 'reconciliation_required')",
+            )
+            .bind(request_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to load ambiguous inference request: {}", e)))?;
+            let (payment_hash, session_id) = request.ok_or_else(|| {
+                Error::Internal(format!(
+                    "Cannot mark request '{}' reconciliation required: invalid current state or missing request",
+                    request_id
+                ))
+            })?;
+
+            let updated_request = sqlx::query(
+                "UPDATE inference_requests SET status = 'reconciliation_required', reconciliation_required = 1, error_code = ?1, error_category = 'reconciliation_required' WHERE id = ?2 AND status IN ('reserved', 'processing', 'stream_interrupted', 'reconciliation_required')",
+            )
+            .bind(reason)
+            .bind(request_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to mark inference request reconciliation required: {}", e)))?;
+            if updated_request.rows_affected() != 1 {
+                return Err(Error::Internal(format!(
+                    "Inference request '{}' changed during reconciliation transition",
+                    request_id
+                )));
+            }
+
+            let reservation_id: Option<String> = sqlx::query_scalar(
+                "SELECT reservation_id FROM inference_requests WHERE id = ?1",
+            )
+            .bind(request_id)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to load inference reservation: {}", e)))?;
+            if let Some(reservation_id) = reservation_id {
+                let updated_reservation = sqlx::query(
+                    "UPDATE session_reservations SET status = 'reconciliation_required', failure_reason = ?1, finalized_at = ?2 WHERE id = ?3 AND session_id IS ?4 AND status IN ('reserved', 'reconciliation_required')",
+                )
+                .bind(reason)
+                .bind(now)
+                .bind(&reservation_id)
+                .bind(session_id.as_deref())
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to protect ambiguous session reservation: {}", e)))?;
+                if updated_reservation.rows_affected() != 1 {
+                    return Err(Error::Internal(format!(
+                        "Reservation '{}' is missing, mismatched, or not protectable",
+                        reservation_id
+                    )));
+                }
+            }
+
+            let existing_item: Option<String> = sqlx::query_scalar(
+                "SELECT id FROM reconciliation_items WHERE item_type = 'inference_request' AND reference_id = ?1 AND status IN ('unresolved', 'in_progress') ORDER BY first_detected_at DESC LIMIT 1",
+            )
+            .bind(request_id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| Error::Internal(format!("Failed to query inference reconciliation item: {}", e)))?;
+
+            if let Some(item_id) = existing_item {
+                sqlx::query(
+                    "UPDATE reconciliation_items SET payment_hash = CASE WHEN ?1 THEN COALESCE(?2, payment_hash) ELSE NULL END, session_id = COALESCE(?3, session_id), status = 'unresolved', reason = ?4, error_details = ?5, next_retry_at = NULL, resolved_at = NULL WHERE id = ?6",
+                )
+                .bind(attach_payment_hash)
+                .bind(if attach_payment_hash { payment_hash.as_deref() } else { None })
+                .bind(session_id.as_deref())
+                .bind(reason)
+                .bind(error_details)
+                .bind(&item_id)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to update inference reconciliation item: {}", e)))?;
+                Ok(item_id)
+            } else {
+                let item_id = uuid::Uuid::new_v4().to_string();
+                sqlx::query(
+                    "INSERT INTO reconciliation_items (id, item_type, reference_id, payment_hash, session_id, status, reason, error_details, attempt_count, first_detected_at, last_attempt_at, next_retry_at, resolved_at) VALUES (?1, 'inference_request', ?2, ?3, ?4, 'unresolved', ?5, ?6, 0, ?7, NULL, NULL, NULL)",
+                )
+                .bind(&item_id)
+                .bind(request_id)
+                .bind(if attach_payment_hash { payment_hash.as_deref() } else { None })
+                .bind(session_id.as_deref())
+                .bind(reason)
+                .bind(error_details)
+                .bind(now)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to create inference reconciliation item: {}", e)))?;
+                Ok(item_id)
+            }
+        }
+        .await;
+
+        match transition_result {
+            Ok(item_id) => {
+                sqlx::query("COMMIT")
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|e| {
+                        Error::Internal(format!(
+                            "Failed to commit ambiguous request transition: {}",
+                            e
+                        ))
+                    })?;
+                Ok(item_id)
+            }
+            Err(error) => {
+                if let Err(rollback_error) = sqlx::query("ROLLBACK").execute(&mut *conn).await {
+                    tracing::error!(
+                        "Failed to roll back ambiguous request transition: {}",
+                        rollback_error
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Startup recovery routine:
     ///
     /// Evaluates in-flight requests that were interrupted by a process termination.
@@ -506,28 +678,42 @@ impl RequestStore {
 
         // 1. Fetch all requests not in a terminal state
         let query = r#"
-            SELECT id, session_id, reservation_id, status, started_at
-            FROM inference_requests
-            WHERE status IN ('reserved', 'processing', 'stream_interrupted')
+            SELECT r.id, r.session_id, r.reservation_id, r.status, r.started_at, r.error_code
+            FROM inference_requests r
+            WHERE r.status IN ('reserved', 'processing', 'stream_interrupted')
+               OR (r.status = 'reconciliation_required' AND NOT EXISTS (
+                   SELECT 1 FROM reconciliation_items i
+                   WHERE i.item_type = 'inference_request'
+                     AND i.reference_id = r.id
+                     AND i.status = 'unresolved'
+               ))
         "#;
 
-        type InFlightRequestRow = (String, Option<String>, Option<String>, String, Option<i64>);
+        type InFlightRequestRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Option<i64>,
+            Option<String>,
+        );
 
         let rows: Vec<InFlightRequestRow> = sqlx::query_as(query)
             .fetch_all(&self.pool)
             .await
             .map_err(|e| Error::Internal(format!("Failed to fetch in-flight requests: {}", e)))?;
 
-        for (req_id, session_id_opt, res_id_opt, status_str, started_at_opt) in rows {
+        for (req_id, session_id_opt, res_id_opt, status_str, started_at_opt, error_code) in rows {
             if started_at_opt.is_none() && status_str == "reserved" {
                 // Definitely undispatched
-                let _ = sqlx::query(
+                sqlx::query(
                     "UPDATE inference_requests SET status = 'failed', failed_at = ?1, error_code = 'server_crash_prior_to_dispatch', error_category = 'startup_recovery' WHERE id = ?2"
                 )
                 .bind(now)
                 .bind(&req_id)
                 .execute(&self.pool)
-                .await;
+                .await
+                .map_err(|e| Error::Internal(format!("Failed to mark undispatched request failed: {}", e)))?;
 
                 if let (Some(sid_str), Some(res_id)) = (session_id_opt, res_id_opt) {
                     if let Ok(uuid) = uuid::Uuid::parse_str(&sid_str) {
@@ -535,16 +721,114 @@ impl RequestStore {
                     }
                 }
             } else {
-                // Ambiguous: dispatch may have occurred
-                let _ = sqlx::query(
-                    "UPDATE inference_requests SET status = 'reconciliation_required', reconciliation_required = 1, error_code = 'unresolved_crash_during_execution', error_category = 'startup_recovery' WHERE id = ?1"
+                // Ambiguous: dispatch may have occurred. Also repairs metadata on requests
+                // already marked reconciliation_required if their item is missing.
+                let reason = if status_str == "reconciliation_required" {
+                    error_code
+                        .as_deref()
+                        .unwrap_or("unresolved_crash_during_execution")
+                } else {
+                    "unresolved_crash_during_execution"
+                };
+                self.mark_ambiguous_reconciliation_required(
+                    &req_id,
+                    reason,
+                    "Node restarted while the request may have been dispatched upstream; execution outcome is unknown",
                 )
-                .bind(&req_id)
-                .execute(&self.pool)
-                .await;
+                .await?;
             }
         }
 
         Ok(definitely_undispatched_reservations)
+    }
+
+    /// Count successfully completed inference requests for a given session.
+    /// Excludes failed, reserved, processing, stream_interrupted, or reconciliation_required requests.
+    pub async fn count_completed_by_session(&self, session_id: &SessionId) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_requests WHERE session_id = ?1 AND status = 'completed'",
+        )
+        .bind(session_id.0.to_string())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to count completed requests for session: {}", e)))?;
+
+        Ok(count.max(0) as u64)
+    }
+
+    /// Count total completed inference requests across all sessions and direct pay-per-request authorizations.
+    /// Excludes failed, reserved, processing, stream_interrupted, or reconciliation_required requests.
+    pub async fn count_completed_total(&self) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_requests WHERE status = 'completed'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to count total completed requests: {}", e)))?;
+
+        Ok(count.max(0) as u64)
+    }
+
+    /// Compute total sats earned from completed inference requests across the node.
+    /// Excludes reservations, unresolved requests, or failed attempts.
+    pub async fn total_completed_revenue_sats(&self) -> Result<u64> {
+        let total: Option<i64> = sqlx::query_scalar(
+            "SELECT SUM(charged_sats) FROM inference_requests WHERE status = 'completed'",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            Error::Internal(format!("Failed to compute total completed revenue: {}", e))
+        })?;
+
+        Ok(total.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Count requests grouped by status.
+    pub async fn count_by_status(&self, status: &str) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inference_requests WHERE status = ?1",
+        )
+        .bind(status)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to count requests by status: {}", e)))?;
+
+        Ok(count.max(0) as u64)
+    }
+
+    /// Aggregate completed inference requests and revenue by model.
+    pub async fn model_activity_breakdown(&self) -> Result<Vec<(String, u64, u64)>> {
+        type Row = (String, i64, Option<i64>);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT model, COUNT(*) as cnt, SUM(charged_sats) as rev FROM inference_requests WHERE status = 'completed' GROUP BY model ORDER BY cnt DESC",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to fetch model activity breakdown: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(model, cnt, rev)| (model, cnt.max(0) as u64, rev.unwrap_or(0).max(0) as u64))
+            .collect())
+    }
+
+    /// Fetch recent inference requests for operator dashboard audit logging.
+    pub async fn fetch_recent_requests(&self, limit: i64) -> Result<Vec<(String, String, String, u64, i64)>> {
+        type Row = (String, String, String, i64, i64);
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT id, model, status, charged_sats, created_at FROM inference_requests ORDER BY created_at DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Internal(format!("Failed to fetch recent requests: {}", e)))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, model, status, sats, created_at)| {
+                (id, model, status, sats.max(0) as u64, created_at)
+            })
+            .collect())
     }
 }

@@ -110,7 +110,10 @@ async fn test_end_to_end_client_node_integration() {
             url: upstream_mock.uri(),
             ..Default::default()
         },
-        lightning: LightningConfig::default(),
+        lightning: LightningConfig {
+            allow_mock: true,
+            ..Default::default()
+        },
         data_dir: ".satsgrid_test_data".to_string(),
         ..Default::default()
     };

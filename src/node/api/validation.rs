@@ -473,6 +473,43 @@ impl ValidatedChatRequest {
             is_stream,
         })
     }
+
+    /// Computes a deterministic SHA-256 canonical request fingerprint covering all inference-affecting fields:
+    /// - `model`
+    /// - `messages` in exact sequence (role and content string/parts)
+    /// - Inference parameters (`temperature`, `top_p`, `max_tokens`, `max_completion_tokens`, `presence_penalty`, `frequency_penalty`, `stream`, etc.)
+    ///
+    /// Excludes transport-only data.
+    pub fn compute_canonical_fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+
+        if let Some(obj) = self.raw.as_object() {
+            // Sort keys to guarantee deterministic order of fields
+            let mut keys: Vec<&String> = obj.keys().collect();
+            keys.sort();
+
+            for k in keys {
+                // Ignore transport-only headers or client annotations if any were embedded
+                if k.starts_with("x-") || k == "client_id" {
+                    continue;
+                }
+                if let Some(val) = obj.get(k) {
+                    hasher.update(k.as_bytes());
+                    hasher.update(b":");
+                    // Serialize value to canonical compact JSON bytes without whitespace
+                    if let Ok(canon_bytes) = serde_json::to_vec(val) {
+                        hasher.update(&canon_bytes);
+                    }
+                    hasher.update(b";");
+                }
+            }
+        } else {
+            hasher.update(self.model.as_bytes());
+        }
+
+        hex::encode(hasher.finalize())
+    }
 }
 
 fn parse_integer_token_bound(

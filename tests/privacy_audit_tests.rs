@@ -48,7 +48,10 @@ fn setup_app() -> axum::Router {
             url: "http://localhost:8080".to_string(),
             ..Default::default()
         },
-        lightning: satsgrid::config::schema::LightningConfig::default(),
+        lightning: satsgrid::config::schema::LightningConfig {
+            allow_mock: true,
+            ..Default::default()
+        },
         data_dir: ".satsgrid_test_data".to_string(),
         ..Default::default()
     };
@@ -130,4 +133,50 @@ async fn test_privacy_audit_prompt_not_logged() {
         !logs.contains(secret_prompt),
         "PRIVACY VIOLATION: The prompt payload was found in the tracing logs!"
     );
+}
+
+#[tokio::test]
+async fn test_privacy_audit_l402_credentials_not_logged_or_returned() {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let shared_buffer = SharedBuffer(buffer.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(shared_buffer)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let app = setup_app();
+    let fake_macaroon = "FAKE_MACAROON_CREDENTIAL_MARKER_41A7";
+    let fake_preimage = "FAKE_PAYMENT_PREIMAGE_MARKER_9C32";
+    let authorization = format!("L402 {fake_macaroon}:{fake_preimage}");
+    let request_body = json!({
+        "model": "llama3.2",
+        "messages": [{"role": "user", "content": "credential privacy check"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .header("Authorization", &authorization)
+                .body(Body::from(serde_json::to_vec(&request_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let response_body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let response_text = String::from_utf8_lossy(&response_body);
+    assert!(!response_text.contains(fake_macaroon));
+    assert!(!response_text.contains(fake_preimage));
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let logs = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    assert!(!logs.contains(fake_macaroon));
+    assert!(!logs.contains(fake_preimage));
+    assert!(!logs.contains(&authorization));
 }

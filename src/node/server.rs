@@ -62,7 +62,13 @@ impl SatsGridServer {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let addr = format!("{}:{}", self.config.server.host, self.config.server.port);
+        self.config.validate()?;
+        let host = &self.config.server.host;
+        let addr = if host.contains(':') {
+            format!("[{}]:{}", host, self.config.server.port)
+        } else {
+            format!("{}:{}", host, self.config.server.port)
+        };
         tracing::info!("Starting SatsGrid Node on {}", addr);
 
         // Initialize persistent SQLite database in data_dir
@@ -140,6 +146,83 @@ impl SatsGridServer {
             }
         };
 
+        let db_arc = Arc::new(db);
+
+        // Synchronize models from upstream into durable ModelStore on startup
+        {
+            let model_store = db_arc.model_store();
+            match proxy.list_models().await {
+                Ok(val) => {
+                    let mut discovered_models = Vec::new();
+                    if let Some(arr) = val.get("data").and_then(|d| d.as_array()) {
+                        for item in arr {
+                            if let Some(id) = item.get("id").and_then(|s| s.as_str()) {
+                                discovered_models.push(
+                                    crate::node::storage::model::DiscoveredModel {
+                                        id: id.to_string(),
+                                        name: item
+                                            .get("name")
+                                            .and_then(|s| s.as_str())
+                                            .unwrap_or(id)
+                                            .to_string(),
+                                        owned_by: item
+                                            .get("owned_by")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| s.to_string()),
+                                        description: item
+                                            .get("description")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| s.to_string()),
+                                        context_length: item
+                                            .get("context_length")
+                                            .and_then(|v| v.as_i64()),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if !discovered_models.is_empty() {
+                        if let Err(e) = model_store
+                            .upsert_discovered(&discovered_models, true)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to upsert discovered models into ModelStore: {}",
+                                e
+                            );
+                        } else {
+                            tracing::info!(
+                                "Synchronized {} models into durable ModelStore",
+                                discovered_models.len()
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Upstream models unavailable on startup (existing catalog preserved): {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        let recon_worker = Arc::new(crate::node::worker::ReconciliationWorker::new(
+            db_arc.clone(),
+            lightning_backend.clone(),
+            crate::node::worker::WorkerConfig::default(),
+        ));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let worker_handle = recon_worker.clone().spawn(shutdown_rx);
+        AppState::set_reconciliation_worker(recon_worker);
+
+        let receipt_signer = Arc::new(crate::node::receipt::ReceiptSigner::load_or_generate(
+            &self.config.data_dir,
+            "satsgrid-node",
+        )?);
+        AppState::set_receipt_signer(receipt_signer);
+
         let state = AppState {
             config: Arc::new(self.config.clone()),
             live_pricing: Arc::new(tokio::sync::RwLock::new(self.config.pricing.clone())),
@@ -149,7 +232,7 @@ impl SatsGridServer {
             proxy,
             stats: Arc::new(crate::node::api::NodeStats::default()),
             admin_token: Arc::new(admin_token),
-            db: Some(Arc::new(db)),
+            db: Some(db_arc),
             concurrency_manager,
         };
 
@@ -162,8 +245,14 @@ impl SatsGridServer {
             .await
             .map_err(|e| crate::common::error::Error::Internal(e.to_string()))?;
 
+        let server_shutdown = async move {
+            shutdown.await;
+            let _ = shutdown_tx.send(true);
+            let _ = worker_handle.await;
+        };
+
         axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
+            .with_graceful_shutdown(server_shutdown)
             .await
             .map_err(|e| crate::common::error::Error::Internal(e.to_string()))?;
 
@@ -270,5 +359,72 @@ impl SatsGridServer {
         );
 
         Ok(new_token)
+    }
+
+    pub fn load_or_generate_nostr_identity(
+        data_dir: &str,
+        configured_nsec: Option<&str>,
+    ) -> Result<nostr_sdk::prelude::Keys> {
+        use nostr_sdk::prelude::Keys;
+        use std::fs;
+        use std::path::Path;
+
+        // 1. Explicit configured nsec
+        if let Some(nsec) = configured_nsec {
+            let trimmed = nsec.trim();
+            if !trimmed.is_empty() {
+                return Keys::parse(trimmed).map_err(|e| {
+                    crate::common::error::Error::Config(format!("Invalid configured nsec: {}", e))
+                });
+            }
+        }
+
+        // 2. Read from persistent file data_dir/.satsgrid_nostr_key
+        let data_path = Path::new(data_dir);
+        if !data_path.exists() {
+            fs::create_dir_all(data_path).map_err(|e| {
+                crate::common::error::Error::Internal(format!(
+                    "Failed to create data directory: {}",
+                    e
+                ))
+            })?;
+        }
+
+        let key_path = data_path.join(".satsgrid_nostr_key");
+        if key_path.exists() {
+            let secret_str = fs::read_to_string(&key_path).map_err(|e| {
+                crate::common::error::Error::Internal(format!(
+                    "Failed to read Nostr identity key: {}",
+                    e
+                ))
+            })?;
+            let trimmed = secret_str.trim();
+            if !trimmed.is_empty() {
+                return Keys::parse(trimmed).map_err(|e| {
+                    crate::common::error::Error::Config(format!(
+                        "Invalid stored Nostr identity key: {}",
+                        e
+                    ))
+                });
+            }
+        }
+
+        // 3. Generate new persistent Nostr identity
+        let new_keys = Keys::generate();
+        let secret_hex = new_keys.secret_key().to_secret_hex();
+        fs::write(&key_path, &secret_hex).map_err(|e| {
+            crate::common::error::Error::Internal(format!(
+                "Failed to persist Nostr identity key: {}",
+                e
+            ))
+        })?;
+
+        tracing::info!(
+            "Generated new persistent Nostr identity (pubkey: {}) and saved to {}",
+            new_keys.public_key().to_hex(),
+            key_path.display()
+        );
+
+        Ok(new_keys)
     }
 }

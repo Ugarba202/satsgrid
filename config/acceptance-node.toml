@@ -1,0 +1,39 @@
+
+# SatsGrid - Final Acceptance Testing
+# Polar Regtest / LND Bob
+
+# Root-level setting — keep this outside all sections.
+data_dir = ".satsgrid-acceptance"
+
+[server]
+host = "127.0.0.1"
+port = 8080
+# admin_token = "your-local-test-admin-token"
+
+[upstream]
+url = "http://127.0.0.1:11434"
+connect_timeout_secs = 10
+response_header_timeout_secs = 60
+stream_idle_timeout_secs = 30
+total_request_timeout_secs = 600
+
+[pricing]
+default_price_sats = 10
+sats_per_prompt_token = 0
+sats_per_completion_token = 0
+
+[lightning]
+backend = "lnd"
+allow_mock = false
+network = "regtest"
+lnd_rest_host = "https://127.0.0.1:8084"
+lnd_macaroon_path = ".satsgrid/regtest/bob_admin.macaroon"
+lnd_tls_cert_path = ".satsgrid/regtest/bob_tls.cert"
+pay_per_request_expiry_secs = 3600
+session_funding_expiry_secs = 2592000
+
+[concurrency]
+max_concurrent_requests = 16
+max_concurrent_per_session = 4
+
+

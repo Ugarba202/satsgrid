@@ -1,6 +1,6 @@
 use crate::common::error::{Error, Result};
 use crate::common::types::{PaymentHash, Satoshis};
-use crate::node::lightning::backend::LightningBackend;
+use crate::node::lightning::backend::{LightningBackend, SettlementOutcome};
 use crate::node::lightning::invoice::Invoice;
 use async_trait::async_trait;
 use rand::RngCore;
@@ -13,6 +13,9 @@ use tokio::sync::Mutex;
 pub struct MockInvoiceState {
     pub preimage: String,
     pub settled: bool,
+    pub settled_at: Option<i64>,
+    pub expired: bool,
+    pub amount_sats: u64,
 }
 
 #[derive(Clone)]
@@ -41,8 +44,21 @@ impl MockLightningBackend {
                 preimage: "0000000000000000000000000000000000000000000000000000000000000000"
                     .to_string(),
                 settled: false,
+                settled_at: None,
+                expired: false,
+                amount_sats: 100,
             });
         entry.settled = true;
+        entry.settled_at = Some(chrono::Utc::now().timestamp());
+    }
+
+    pub async fn simulate_expiration(&self, payment_hash: &PaymentHash) {
+        let mut lock = self.invoices.lock().await;
+        if let Some(entry) = lock.get_mut(&payment_hash.0) {
+            if !entry.settled {
+                entry.expired = true;
+            }
+        }
     }
 
     fn parse_mock_payment_hash(invoice: &str) -> Option<String> {
@@ -68,6 +84,7 @@ impl MockLightningBackend {
             .ok_or_else(|| Error::Lightning("Unknown mock invoice".to_string()))?;
 
         invoice_state.settled = true;
+        invoice_state.settled_at = Some(chrono::Utc::now().timestamp());
 
         Ok(invoice_state.preimage.clone())
     }
@@ -95,6 +112,9 @@ impl LightningBackend for MockLightningBackend {
             MockInvoiceState {
                 preimage: preimage_str,
                 settled: false,
+                settled_at: None,
+                expired: false,
+                amount_sats: amount_sats.0,
             },
         );
 
@@ -111,6 +131,31 @@ impl LightningBackend for MockLightningBackend {
             Ok(state.settled)
         } else {
             Ok(false)
+        }
+    }
+
+    async fn check_settlement(&self, payment_hash: &PaymentHash) -> Result<SettlementOutcome> {
+        let invoices = self.invoices.lock().await;
+        if let Some(state) = invoices.get(&payment_hash.0) {
+            if state.settled {
+                Ok(SettlementOutcome::ConfirmedSettled {
+                    preimage: Some(state.preimage.clone()),
+                    settled_at: state
+                        .settled_at
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                    amount_sats: Some(state.amount_sats),
+                })
+            } else if state.expired {
+                Ok(SettlementOutcome::ConfirmedExpired {
+                    expired_at: chrono::Utc::now().timestamp(),
+                })
+            } else {
+                Ok(SettlementOutcome::ConfirmedPending { expires_at: None })
+            }
+        } else {
+            Ok(SettlementOutcome::Unknown {
+                details: format!("Mock invoice '{}' not found", payment_hash.0),
+            })
         }
     }
 }

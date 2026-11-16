@@ -71,32 +71,54 @@ SatsGrid operates as a modular, high-throughput gateway sitting directly between
 
 ---
 
-## Current Status & Roadmap
+## Current Status & Capabilities
 
-SatsGrid has completed its Phase 1 durable persistence, payment authorization, and inference lifecycle foundation:
+SatsGrid has completed Epics E01–E07, establishing a fully functional permissionless inference ecosystem:
 
-- **Completed Foundation (Phase 1):**
-  - Persistent SQLite storage with atomic WAL PRAGMAs.
-  - Single-use L402 payment authorization with atomic reservation.
-  - Durable session budget manager with append-only accounting ledgers.
-  - Durable inference request lifecycle coordinating payments, sessions, and proxy execution.
+- **PayGuard Accounting Engine:**
+  - Strict two-phase reservations enforcing `remaining + reserved + spent = total`.
+  - Single-use L402 payment authorization preventing double-spending and replay attacks.
+  - Durable inference request lifecycle (`reserved` -> `processing` -> `completed` / `failed` / `stream_interrupted`).
   - Monitored SSE stream delivery with drop guards and atomic transition enforcement.
-  - Conservative startup crash recovery protecting against double-spends and unbilled compute.
-- **Planned Capabilities (Phase 2):**
-  - **PayGuard & Hold Invoices:** Introducing conditional hold-invoice settlement to hold satoshis until token generation completes, enabling native payment cancellation on upstream failures.
-  - **Dynamic Streaming Token Refund:** Reconciling token over-reservations dynamically upon SSE completion.
-  - **Provider Marketplace Routing:** Automated multi-node reputation and GPU attestation for the Nostr discovery network.
+  - Conservative startup crash recovery retaining ambiguous compute under `reconciliation_required = 1`.
+- **Ed25519 Signed Inference Receipts:**
+  - Persisted receipts delivered via `x-satsgrid-receipt-id` header or SSE `event: receipt`.
+  - Independent CLI verification (`satsgrid receipt verify`) validating provider identity, token usage, and signature.
+- **Nostr Decentralized Discovery (Kind 31990):**
+  - Persistent provider identity (`.satsgrid_nostr_key`) linked to receipt signing keys.
+  - Client-side dynamic routing selecting the lowest-priced online provider (`satsgrid call`).
+  - Anti-SSRF endpoint validation rejecting private RFC1918, loopback, link-local, and cloud metadata targets.
+- **Accessible & Voice-Assisted Playground:**
+  - Speech-to-text voice dictation (STT) guarded against accidental submission.
+  - Assistant response read-aloud (TTS) with sentence chunking and credential redaction.
+  - Authoritative spoken confirmations gated strictly behind backend payment admission.
 
 ---
 
-## Quick Start
+## Technical Boundaries & Honest Limitations
 
-### Prerequisites
+In alignment with production engineering and audit integrity:
+1. **Dynamic Routing Tier**: Dynamic remote provider selection is implemented at the CLI tier (`satsgrid call`). The local Playground and `/v1/chat/completions` route to the node's configured upstream to preserve local L402 and PayGuard non-custodial accounting boundaries.
+2. **Provider Health Probing**: Health status currently evaluates passive 24-hour freshness TTLs rather than background active ping daemons.
+3. **SSRF Outbound Connection Boundary**: IP validation is performed during discovery; protection against active DNS rebinding or redirect chains at the connection boundary remains an acknowledged future hardening target.
+4. **Receipt Cryptographic Scope**: An Ed25519 receipt proves that the provider's key signed the token usage and request metadata; it does not independently prove the semantic honesty of the generated completion or Lightning network finality.
+5. **Speech Recognition Support**: Web Speech API dictation is supported in Chromium browsers; desktop Firefox requires external speech engines. Cloud-transcribed audio in certain browsers is governed by browser vendor policies.
+
+---
+
+## Quick Start & Demo Runbook
+
+- **Hackathon Demo Runbook**: Follow step-by-step instructions in [docs/demo-runbook.md](docs/demo-runbook.md) for live node demonstration, Polar Regtest LND payments, receipt verification, and voice playground walkthrough.
+- **Developer API Quickstart**: See [docs/quickstart.md](docs/quickstart.md) for cURL, Python, and TypeScript L402 code samples.
+
+### Local Development Quick Start
+
+#### Prerequisites
 
 - [Rust 1.85+](https://rust-lang.org)
 - An OpenAI-compatible model runner (such as [Ollama](https://ollama.com) running locally on port 11434).
 
-### 1. Build SatsGrid
+#### 1. Build SatsGrid
 
 ```bash
 cargo build --release
@@ -104,7 +126,7 @@ cargo build --release
 
 The resulting binary will be at `target/release/satsgrid`.
 
-### 2. Configure Your Node
+#### 2. Configure Your Node
 
 Copy the example configuration:
 
@@ -112,15 +134,15 @@ Copy the example configuration:
 cp config/node.example.toml config/node.toml
 ```
 
-By default, `config/node.toml` binds to `127.0.0.1:8080`, proxies upstream requests to `http://127.0.0.1:11434`, and uses the `mock` Lightning backend for testing without spending real satoshis.
+By default, `config/node.toml` binds to `127.0.0.1:8080`, proxies upstream requests to `http://127.0.0.1:11434`, and uses the `mock` Lightning backend for testing without spending real satoshis. For Polar Regtest LND integration, refer to `config/regtest-node.example.toml` and [docs/demo-runbook.md](docs/demo-runbook.md).
 
-### 3. Start the SatsGrid Node
+#### 3. Start the SatsGrid Node
 
 ```bash
 ./target/release/satsgrid node start --config config/node.toml
 ```
 
-### 4. Run an Inference Request (CLI)
+#### 4. Run an Inference Request (CLI)
 
 In another terminal, send an inference query through the SatsGrid gateway:
 
@@ -132,6 +154,19 @@ In another terminal, send an inference query through the SatsGrid gateway:
 ```
 
 When running against the `mock` backend, the CLI client automatically settles the mock invoice challenge and streams the completion response.
+
+---
+
+## Developer API & Integration Quickstart
+
+For developers integrating applications, autonomous agents, or services using cURL, Python, or Node.js, read our comprehensive [Developer API Quickstart Guide](docs/quickstart.md).
+
+It covers:
+- HTTP 402 challenge parsing and BOLT11 invoice payment flows.
+- Multi-turn Session Budgets and Pay-Per-Request authorization.
+- Working examples in cURL, Python (`httpx`), and Node.js (`fetch`).
+- Streaming completions via Server-Sent Events (SSE).
+- Cryptographic receipt verification and security best practices.
 
 ---
 
