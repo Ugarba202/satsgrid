@@ -1,10 +1,14 @@
 # SatsGrid
 
-\<p align="center">   \<strong>Permissionless AI Inference. Paid in Sats. Accessible by Design.\</strong> \</p>
+### Permissionless AI Inference. Paid in Sats. Accessible by Design.
 
-\<p align="center">   \<a href="[https://youtu.be/eDXZndAu0OQ](https://youtu.be/eDXZndAu0OQ)">Watch the SatsGrid Demo\</a>   ·   \<a href="#getting-started">Getting Started\</a>   ·   \<a href="#architecture">Architecture\</a>   ·   \<a href="#developer-integration">Developer Integration\</a> \</p>
+[**▶ Watch the SatsGrid Demo**](https://youtu.be/eDXZndAu0OQ)
+
+[Getting Started](#getting-started) · [Architecture](#architecture) · [Developer Integration](#developer-integration)
 
 ---
+
+
 
 ## What is SatsGrid?
 
@@ -912,11 +916,14 @@ SatsGrid is distributed under the terms of the **MIT License**.
 Please refer to the repository's license files for the applicable licensing and attribution terms.
 
 ---
+---
 
-\<p align="center">
-&#x20; \<strong>SatsGrid\</strong>
-&#x20; \<br />
-&#x20; Permissionless AI Inference. Paid in Sats. Accessible by Design.
-&#x20; \<br />\<br />
-&#x20; Building a more open, accessible, and permissionless AI compute ecosystem.
-\</p>
+<p align="center">
+
+**SatsGrid**
+
+*Permissionless AI Inference. Paid in Sats. Accessible by Design.*
+
+Building a more open, accessible, and permissionless AI compute ecosystem.
+
+</p>
